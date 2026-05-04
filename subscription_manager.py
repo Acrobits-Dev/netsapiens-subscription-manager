@@ -431,10 +431,16 @@ def extract_domain_list(data: Any) -> list[DomainInfo]:
 class ApiClient:
     """Simple HTTP client with automatic Bearer token authentication."""
     
-    def __init__(self, base_url: str, access_token: Optional[str] = None):
+    def __init__(
+        self,
+        base_url: str,
+        access_token: Optional[str] = None,
+        token_refresher: Optional[Callable[[], str]] = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.access_token = access_token
         self.ssl_ctx = ssl.create_default_context()
+        self._token_refresher = token_refresher
     
     def set_token(self, access_token: str):
         """Set the access token for authenticated requests."""
@@ -455,6 +461,9 @@ class ApiClient:
         )
         return result
 
+    _TOKEN_EXPIRED_MARKER = "The access token provided has expired"
+    _MAX_TOKEN_REFRESH_RETRIES = 5
+
     def _make_request_with_status(
         self,
         path: str,
@@ -462,7 +471,7 @@ class ApiClient:
         data: Optional[bytes] = None,
         content_type: Optional[str] = None,
         extra_headers: Optional[dict] = None,
-        auth_token: Optional[str] = None
+        auth_token: Optional[str] = None,
     ) -> tuple[bool, Optional[dict]]:
         """
         Internal method to make HTTP requests, returning success status.
@@ -472,42 +481,64 @@ class ApiClient:
             - success is True for any 2XX response
             - response_data is the parsed JSON body, or None if empty/unparseable
         """
-        url = f"{self.base_url}{path}"
-        headers = {}
-        
-        # Use provided auth_token, fall back to stored access_token
-        token = auth_token or self.access_token
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        
-        if content_type:
-            headers["Content-Type"] = content_type
-        
-        if extra_headers:
-            headers.update(extra_headers)
-        
-        request = urllib.request.Request(url, data=data, headers=headers, method=method)
-        
-        try:
-            with urllib.request.urlopen(request, context=self.ssl_ctx) as response:
-                response_body = response.read().decode("utf-8")
-                if response_body:
-                    return (True, json.loads(response_body))
-                return (True, None)
-        except urllib.error.HTTPError as e:
-            print(f"HTTP Error {e.code}: {e.reason}")
+        token_refresh_attempts = 0
+
+        while True:
+            url = f"{self.base_url}{path}"
+            headers = {}
+
+            token = auth_token or self.access_token
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+
+            if content_type:
+                headers["Content-Type"] = content_type
+
+            if extra_headers:
+                headers.update(extra_headers)
+
+            request = urllib.request.Request(url, data=data, headers=headers, method=method)
+
             try:
-                error_body = e.read().decode("utf-8")
-                print(f"Response: {error_body}")
-            except Exception:
-                pass
-            return (False, None)
-        except urllib.error.URLError as e:
-            print(f"URL Error: {e.reason}")
-            return (False, None)
-        except json.JSONDecodeError as e:
-            print(f"JSON decode error: {e}")
-            return (True, None)  # Request succeeded but response wasn't valid JSON
+                with urllib.request.urlopen(request, context=self.ssl_ctx) as response:
+                    response_body = response.read().decode("utf-8")
+                    if response_body:
+                        return (True, json.loads(response_body))
+                    return (True, None)
+            except urllib.error.HTTPError as e:
+                error_body = ""
+                try:
+                    error_body = e.read().decode("utf-8")
+                except Exception:
+                    pass
+
+                if (
+                    e.code == 401
+                    and self._token_refresher is not None
+                    and auth_token is None
+                    and self._TOKEN_EXPIRED_MARKER in error_body
+                    and token_refresh_attempts < self._MAX_TOKEN_REFRESH_RETRIES
+                ):
+                    token_refresh_attempts += 1
+                    print(f"Access token expired, refreshing (attempt {token_refresh_attempts}/{self._MAX_TOKEN_REFRESH_RETRIES})...")
+                    try:
+                        self.access_token = self._token_refresher()
+                        print("Access token refreshed successfully, retrying request...")
+                        continue
+                    except Exception as refresh_error:
+                        print(f"Token refresh failed: {refresh_error}")
+                        return (False, None)
+
+                print(f"HTTP Error {e.code}: {e.reason}")
+                if error_body:
+                    print(f"Response: {error_body}")
+                return (False, None)
+            except urllib.error.URLError as e:
+                print(f"URL Error: {e.reason}")
+                return (False, None)
+            except json.JSONDecodeError as e:
+                print(f"JSON decode error: {e}")
+                return (True, None)  # Request succeeded but response wasn't valid JSON
     
     def get(self, path: str) -> Optional[dict]:
         """Make a GET request with automatic authentication."""
@@ -1443,6 +1474,41 @@ def fetch_subscriptions(
 # Authentication
 # ===============================================
 
+def _fetch_oauth_token(ns_api_host: str, oauth_config: OAuthConfig) -> tuple[str, str]:
+    """
+    Fetch an OAuth token from the NetSapiens API.
+
+    Uses a plain ApiClient without a token_refresher to avoid recursion during refresh.
+
+    Returns (access_token, user_scope).
+    Raises RuntimeError if the request fails or required fields are missing.
+    """
+    token_client = ApiClient(ns_api_host)
+    response = token_client.post_json(
+        "/ns-api/v2/tokens",
+        body={
+            "grant_type": "password",
+            "username": oauth_config.username,
+            "password": oauth_config.password,
+            "client_id": oauth_config.client_id,
+            "client_secret": oauth_config.client_secret,
+        },
+    )
+
+    if not response:
+        raise RuntimeError(f"Failed to fetch OAuth token from {ns_api_host}: Empty response from token request")
+
+    access_token = json_value(response, "access_token")
+    user_scope = json_value(response, "scope")
+
+    if not access_token:
+        raise RuntimeError(f"Failed to fetch OAuth token from {ns_api_host}: access_token not found in response: {response}")
+    if not user_scope:
+        raise RuntimeError(f"Failed to fetch OAuth token from {ns_api_host}: scope not found in response: {response}")
+
+    return access_token, user_scope
+
+
 def get_authenticated_api_client(
     config: Config,
     oauth_config: OAuthConfig,
@@ -1452,40 +1518,20 @@ def get_authenticated_api_client(
     Create an authenticated API client for the NetSapiens API.
     
     Returns an AuthResult with the access token set on the client and the user scope extracted.
+    The client is configured with automatic token refresh on 401 responses.
     Raises RuntimeError if authentication fails.
     """
-    # Create the API client to interact with the NetSapiens API.
-    client = ApiClient(config.ns_api_host)
-    
     set_stage(context, ProcessingStage.AUTH_FETCH_OAUTH_TOKEN)
-    
-    # Get oauth token using NetSapiens API v2
+
     print("Fetching OAuth token...")
-    response = client.post_json(
-        "/ns-api/v2/tokens",
-        body={
-            "grant_type": "password",
-            "username": oauth_config.username,
-            "password": oauth_config.password,
-            "client_id": oauth_config.client_id,
-            "client_secret": oauth_config.client_secret
-        }
-    )
-    
-    if not response:
-        raise RuntimeError(f"Failed to fetch OAuth token from {config.ns_api_host}: Empty response from token request")
-    
-    access_token = json_value(response, "access_token")
-    user_scope = json_value(response, "scope")
-    
-    if not access_token:
-        raise RuntimeError(f"Failed to fetch OAuth token from {config.ns_api_host}: access_token not found in response: {response}")
-    if not user_scope:
-        raise RuntimeError(f"Failed to fetch OAuth token from {config.ns_api_host}: scope not found in response: {response}")
-    
-    # Set the access token for all subsequent authenticated requests.
+    access_token, user_scope = _fetch_oauth_token(config.ns_api_host, oauth_config)
     print("Access token set successfully")
-    client.set_token(access_token)
+
+    def refresh_token() -> str:
+        token, _ = _fetch_oauth_token(config.ns_api_host, oauth_config)
+        return token
+
+    client = ApiClient(config.ns_api_host, access_token=access_token, token_refresher=refresh_token)
 
     return AuthResult(client=client, user_scope=user_scope)
 
