@@ -611,7 +611,7 @@ class ApiClient:
 #     "reseller": "Acme_Networks",
 #     "domain": "Acme",
 #     "user": "1000",
-#     "preferred-server": "https:\/\/sipns.acme.net",
+#     "preferred-server": "sipns.acme.net",
 #     "current-active-server": "",
 #     "status": "pending",
 #     "error-count": 0,
@@ -1301,6 +1301,10 @@ def _build_subscription_body(
     cloud_id = f"{config.cloud_id}{EDITABLE_VERSION_CLOUD_ID_SUFFIX}" if needs_suffix else config.cloud_id
     post_url = f"{config.callback_host}/netsapiens/callbacks/{cloud_id}/{path_suffix}?password={encoded_password}"
     
+    # preferred-server expects host only (no scheme); ns_api_host is normalized
+    # with a scheme by _normalize_base_url, so .netloc is always populated.
+    preferred_server_host = urllib.parse.urlparse(config.ns_api_host).netloc
+
     return {
         "post-url": post_url,
         "model": model.value,
@@ -1309,7 +1313,7 @@ def _build_subscription_body(
         "reseller": reseller,
         "user-scope": user_scope,
         "subscription-geo-support": "yes",
-        "preferred-server": config.ns_api_host,
+        "preferred-server": preferred_server_host,
         "subscription-expires-datetime": subscription_expires
     }
 
