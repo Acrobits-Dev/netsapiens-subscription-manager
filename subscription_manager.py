@@ -696,6 +696,7 @@ class SubscriptionReviewResult:
     subscriptions_in_disallowed_domains: list[Subscription]
     subscriptions_in_unknown_domains: list[Subscription]
     subscriptions_with_invalid_active_server: list[Subscription]
+    subscriptions_with_outdated_post_url: list[Subscription]
     domains_without_message_subscription: list[str]
     domains_without_messagesession_subscription: list[str]
     missing_allowed_domains: list[str]
@@ -750,8 +751,13 @@ class SubscriptionIssue(Enum):
       Present when coverage is PARTIALLY_COVERED, COVERED_WITH_ISSUES (partial), or NOT_COVERED.
     
     Subscription health issues (triggers COVERED_WITH_ISSUES status):
-    - INVALID_ACTIVE_SERVER: A subscription exists but has empty current_active_server.
-      This indicates the subscription may not be functioning properly.
+    - INVALID_ACTIVE_SERVER: A subscription exists but its current_active_server
+      is in an abnormal state — either empty (no server resolved yet) or
+      scheme-prefixed like "https://host" (stale data from an older script
+      version that wrongly sent preferred-server with a scheme). Either
+      condition indicates the subscription is not in a clean state and will
+      be re-posted via update_subscription on the next run so NS can
+      re-resolve current_active_server in the canonical host-only format.
     """
     MISSING_MESSAGE_SUBSCRIPTION = "MISSING_MESSAGE_SUBSCRIPTION"
     MISSING_MESSAGESESSION_SUBSCRIPTION = "MISSING_MESSAGESESSION_SUBSCRIPTION"
@@ -982,7 +988,8 @@ def review_subscriptions(
     - Subscriptions not targeting our callback host (config.callback_host) are filtered out.
     - Subscriptions in domains not returned by the API are marked as unknown.
     - Allowed/disallowed domains are mutually exclusive; subscriptions outside the allowed list (or inside the disallowed list) are surfaced.
-    - For the remaining subscriptions, missing or empty `current_active_server` is flagged.
+    - For the remaining subscriptions, abnormal `current_active_server` values are flagged
+      (empty, or scheme-prefixed such as "https://host" — see _is_active_server_invalid).
     - For each relevant domain, presence of both `message` and `messagesession` subscriptions is verified.
     - `editable_version_domain` from `config` is always treated as eligible for the checks above even if not in allowed domains and never treated as disallowed.
     """
@@ -1039,7 +1046,15 @@ def review_subscriptions(
         subscription for subscription in subscriptions if subscription.id not in excluded_subscription_ids
     ]
     subscriptions_with_invalid_active_server = [
-        subscription for subscription in allowed_subscriptions if not subscription.current_active_server
+        subscription for subscription in allowed_subscriptions
+        if _is_active_server_invalid(subscription.current_active_server)
+    ]
+    # Detect subscriptions whose post-url path no longer matches what the current
+    # config would produce (e.g. created with a wrong cloud_id in a previous run).
+    # These need their body re-posted via update_subscription so the path is healed.
+    subscriptions_with_outdated_post_url = [
+        subscription for subscription in allowed_subscriptions
+        if _post_url_path_is_outdated(subscription, config)
     ]
     domains_without_message_subscription: list[str] = []
     domains_without_messagesession_subscription: list[str] = []
@@ -1072,6 +1087,7 @@ def review_subscriptions(
         subscriptions_in_disallowed_domains=subscriptions_in_disallowed_domains,
         subscriptions_in_unknown_domains=subscriptions_in_unknown_domains,
         subscriptions_with_invalid_active_server=subscriptions_with_invalid_active_server,
+        subscriptions_with_outdated_post_url=subscriptions_with_outdated_post_url,
         domains_without_message_subscription=domains_without_message_subscription,
         domains_without_messagesession_subscription=domains_without_messagesession_subscription,
         missing_allowed_domains=missing_allowed_domains
@@ -1181,8 +1197,9 @@ def build_status_report(
                 issues.append(SubscriptionIssue.MISSING_MESSAGESESSION_SUBSCRIPTION)
             
             # Check for invalid active server on existing subscriptions
+            # (empty or scheme-prefixed; see _is_active_server_invalid)
             for sub in [message_sub, messagesession_sub]:
-                if sub and not sub.current_active_server:
+                if sub and _is_active_server_invalid(sub.current_active_server):
                     if SubscriptionIssue.INVALID_ACTIVE_SERVER not in issues:
                         issues.append(SubscriptionIssue.INVALID_ACTIVE_SERVER)
             
@@ -1284,6 +1301,69 @@ def send_status_report(report: StatusReport, config: Config) -> bool:
 EDITABLE_VERSION_CLOUD_ID_SUFFIX = "*"
 
 
+def _build_post_url(model: SubscriptionModel, domain: str, config: Config) -> str:
+    """
+    Build the canonical post-url for a (model, domain) pair under the current config.
+
+    Single source of truth for both creating new subscriptions and validating
+    existing ones (see _post_url_path_is_outdated).
+    """
+    path_suffix = model.to_path_suffix()
+    encoded_password = urllib.parse.quote(config.callback_password, safe='')
+    # Append wildcard suffix for editable version domain to allow broader matching
+    is_editable_domain = domain == config.editable_version_domain
+    needs_suffix = is_editable_domain and not config.cloud_id.endswith(EDITABLE_VERSION_CLOUD_ID_SUFFIX)
+    cloud_id = f"{config.cloud_id}{EDITABLE_VERSION_CLOUD_ID_SUFFIX}" if needs_suffix else config.cloud_id
+    return f"{config.callback_host}/netsapiens/callbacks/{cloud_id}/{path_suffix}?password={encoded_password}"
+
+
+def _post_url_path_is_outdated(subscription: Subscription, config: Config) -> bool:
+    """
+    Return True if the subscription's post_url path no longer matches the canonical
+    path computed from the current config (e.g. because cloud_id has changed since
+    the subscription was created).
+
+    Compares only the URL path, not the query string. This deliberately ignores
+    incidental differences in the password query parameter (encoding, rotation)
+    and focuses on the cloud_id / model path segment, which is what we want
+    to detect and heal here.
+
+    Subscriptions whose model is not MESSAGE or MESSAGE_SESSION have no canonical
+    path and are treated as not outdated.
+    """
+    if subscription.model not in (SubscriptionModel.MESSAGE, SubscriptionModel.MESSAGE_SESSION):
+        return False
+    expected_path = urllib.parse.urlparse(
+        _build_post_url(subscription.model, subscription.domain, config)
+    ).path
+    actual_path = urllib.parse.urlparse(subscription.post_url).path
+    return actual_path != expected_path
+
+
+def _is_active_server_invalid(active_server: str) -> bool:
+    """
+    Return True if current_active_server is in an abnormal state that warrants
+    re-posting the subscription via update_subscription.
+
+    The expected canonical format reported by NetSapiens is host-only
+    (e.g. "sipns.acme.net"). Two conditions are treated as invalid:
+
+    1. Empty: the subscription has no active server resolved yet
+       (newly created, or NS lost the binding).
+    2. Scheme-prefixed (e.g. "https://sipns.acme.net"): stale data left over
+       from older script versions that incorrectly sent preferred-server with
+       a scheme. Re-posting with the now-correct host-only preferred-server
+       lets NS re-resolve current-active-server in the canonical format.
+
+    Detection of (2) relies on the literal "://" substring rather than
+    urlparse's scheme field, because a bare "host:port" string can be
+    misclassified as having a scheme by some URL parsers.
+    """
+    if not active_server:
+        return True
+    return "://" in active_server
+
+
 def _build_subscription_body(
     model: SubscriptionModel,
     domain: str,
@@ -1293,14 +1373,8 @@ def _build_subscription_body(
     config: Config
 ) -> dict:
     """Build the JSON body for subscription create/update requests."""
-    path_suffix = model.to_path_suffix()
-    encoded_password = urllib.parse.quote(config.callback_password, safe='')
-    # Append wildcard suffix for editable version domain to allow broader matching
-    is_editable_domain = domain == config.editable_version_domain
-    needs_suffix = is_editable_domain and not config.cloud_id.endswith(EDITABLE_VERSION_CLOUD_ID_SUFFIX)
-    cloud_id = f"{config.cloud_id}{EDITABLE_VERSION_CLOUD_ID_SUFFIX}" if needs_suffix else config.cloud_id
-    post_url = f"{config.callback_host}/netsapiens/callbacks/{cloud_id}/{path_suffix}?password={encoded_password}"
-    
+    post_url = _build_post_url(model, domain, config)
+
     # preferred-server expects host only (no scheme); ns_api_host is normalized
     # with a scheme by _normalize_base_url, so .netloc is always populated.
     preferred_server_host = urllib.parse.urlparse(config.ns_api_host).netloc
@@ -1576,9 +1650,11 @@ def main(context: Optional[ProcessingContext] = None):
     disallowed_subs = subs_review.subscriptions_in_disallowed_domains
     unknown_subs = subs_review.subscriptions_in_unknown_domains
     invalid_active_server_subs = subs_review.subscriptions_with_invalid_active_server
+    outdated_post_url_subs = subs_review.subscriptions_with_outdated_post_url
     print(f"Subscriptions in disallowed domains: {_format_subscription_list(disallowed_subs)}")
     print(f"Subscriptions in unknown domains: {_format_subscription_list(unknown_subs)}")
     print(f"Subscriptions with invalid active server: {_format_subscription_list(invalid_active_server_subs)}")
+    print(f"Subscriptions with outdated post-url path: {_format_subscription_list(outdated_post_url_subs)}")
     print(f"Domains without message subscription: {_format_list_preview(subs_review.domains_without_message_subscription)}")
     print(f"Domains without messagesession subscription: {_format_list_preview(subs_review.domains_without_messagesession_subscription)}")
     print(f"Missing allowed domains: {_format_list_preview(subs_review.missing_allowed_domains)}")
@@ -1593,7 +1669,20 @@ def main(context: Optional[ProcessingContext] = None):
     # Calculate expiration date (20 years from now)
     subscription_expires = (datetime.now(timezone.utc) + timedelta(days=365 * 20)).strftime("%Y-%m-%d %H:%M:%S")
 
-    for subscription in subs_review.subscriptions_with_invalid_active_server:
+    # Merge subs that need re-posting (invalid active server OR outdated post-url path)
+    # and dedup by id so a sub flagged by both conditions is only updated once.
+    subscriptions_to_update: list[Subscription] = []
+    seen_update_ids: set[str] = set()
+    for subscription in (
+        subs_review.subscriptions_with_invalid_active_server
+        + subs_review.subscriptions_with_outdated_post_url
+    ):
+        if subscription.id in seen_update_ids:
+            continue
+        seen_update_ids.add(subscription.id)
+        subscriptions_to_update.append(subscription)
+
+    for subscription in subscriptions_to_update:
         reseller = domain_to_reseller.get(subscription.domain)
         if not reseller:
             print(f"Warning: Could not find reseller for domain {subscription.domain}, skipping subscription update")
