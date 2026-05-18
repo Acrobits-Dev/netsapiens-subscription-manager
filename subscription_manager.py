@@ -14,6 +14,7 @@ Use cases:
 
 import json
 import os
+import time
 import traceback
 import urllib.request
 import urllib.parse
@@ -575,10 +576,33 @@ class ApiClient:
             data=json.dumps(body).encode("utf-8"),
             content_type="application/json"
         )
-    
+
+    def put_json_with_status(self, path: str, body: dict) -> tuple[bool, Optional[dict]]:
+        """
+        Make a PUT request with JSON body, returning success status.
+
+        Returns:
+            tuple of (success: bool, response_data: Optional[dict])
+        """
+        return self._make_request_with_status(
+            path,
+            method="PUT",
+            data=json.dumps(body).encode("utf-8"),
+            content_type="application/json"
+        )
+
     def delete(self, path: str) -> Optional[dict]:
         """Make a DELETE request with automatic authentication."""
         return self._make_request(path, method="DELETE")
+
+    def delete_with_status(self, path: str) -> tuple[bool, Optional[dict]]:
+        """
+        Make a DELETE request, returning success status.
+
+        Returns:
+            tuple of (success: bool, response_data: Optional[dict])
+        """
+        return self._make_request_with_status(path, method="DELETE")
     
     def post_form(
         self,
@@ -1392,6 +1416,27 @@ def _build_subscription_body(
     }
 
 
+_SUBSCRIPTION_CREATE_MONO_TIMES: list[float] = []
+_SUBSCRIPTION_CREATE_MAX_PER_SECOND = 3
+
+
+def _throttle_subscription_creates() -> None:
+    """Block until a new subscription POST is allowed (max _SUBSCRIPTION_CREATE_MAX_PER_SECOND per 1s sliding window)."""
+    window_sec = 1.0
+    times = _SUBSCRIPTION_CREATE_MONO_TIMES
+    while True:
+        now = time.monotonic()
+        cutoff = now - window_sec
+        while times and times[0] <= cutoff:
+            times.pop(0)
+        if len(times) < _SUBSCRIPTION_CREATE_MAX_PER_SECOND:
+            times.append(time.monotonic())
+            return
+        sleep_for = window_sec - (now - times[0])
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+
 def create_subscription(
     client: ApiClient,
     model: SubscriptionModel,
@@ -1403,7 +1448,9 @@ def create_subscription(
 ) -> Optional[str]:
     """Create a subscription and return the subscription ID."""
     json_body = _build_subscription_body(model, domain, reseller, user_scope, subscription_expires, config)
-    
+
+    _throttle_subscription_creates()
+
     print(f"Creating {model.value} subscription...")
     
     response = client.post_json("/ns-api/v2/subscriptions", json_body)
@@ -1431,26 +1478,30 @@ def update_subscription(
     user_scope: str,
     subscription_expires: str,
     config: Config
-) -> None:
-    """Update a subscription."""
+) -> bool:
+    """Update a subscription. Returns True on success, False on failure."""
     json_body = _build_subscription_body(subscription.model, subscription.domain, reseller, user_scope, subscription_expires, config)
     
     print(f"Updating {subscription.model.value} subscription {subscription.id}...")
     
-    response = client.put_json(f"/ns-api/v2/subscriptions/{subscription.id}", json_body)
+    success, response = client.put_json_with_status(f"/ns-api/v2/subscriptions/{subscription.id}", json_body)
     
-    if response:
+    if success:
         print(f"{subscription.model.value} subscription {subscription.id} updated successfully")
+        return True
     else:
         print(f"Error: Empty or failed response from {subscription.model.value} subscription update request")
+        return False
 
 
 def delete_subscription(client: ApiClient, subscription_id: str) -> bool:
-    """Delete a subscription. Returns True if the request completed (success or empty response)."""
-    response = client.delete(f"/ns-api/v2/subscriptions/{subscription_id}")
-    # A None response from _make_request could mean empty success or error (error is already logged)
-    print(f"Subscription {subscription_id} deleted successfully")
-    return True
+    """Delete a subscription. Returns True on success, False on failure."""
+    success, _ = client.delete_with_status(f"/ns-api/v2/subscriptions/{subscription_id}")
+    if success:
+        print(f"Subscription {subscription_id} deleted successfully")
+    else:
+        print(f"Error: Failed to delete subscription {subscription_id}")
+    return success
 
 # ===============================================
 # Paginated API fetch helper
@@ -1660,11 +1711,17 @@ def main(context: Optional[ProcessingContext] = None):
     print(f"Missing allowed domains: {_format_list_preview(subs_review.missing_allowed_domains)}")
 
     set_stage(context, ProcessingStage.APPLY_SUBSCRIPTION_CHANGES)
+
+    failed_deletes: list[str] = []
+    failed_updates: list[str] = []
+    failed_creates: list[str] = []
+
     # delete subs in disallowed domains and unknown domains
     subscriptions_to_delete = subs_review.subscriptions_in_disallowed_domains + subs_review.subscriptions_in_unknown_domains
     for subscription in subscriptions_to_delete:
         print(f"Deleting subscription: {subscription.id}")
-        delete_subscription(client, subscription.id)
+        if not delete_subscription(client, subscription.id):
+            failed_deletes.append(subscription.id)
     
     # Calculate expiration date (20 years from now)
     subscription_expires = (datetime.now(timezone.utc) + timedelta(days=365 * 20)).strftime("%Y-%m-%d %H:%M:%S")
@@ -1687,21 +1744,22 @@ def main(context: Optional[ProcessingContext] = None):
         if not reseller:
             print(f"Warning: Could not find reseller for domain {subscription.domain}, skipping subscription update")
             continue
-        update_subscription(
+        if not update_subscription(
             client,
             subscription,
             reseller,
             user_scope,
             subscription_expires,
             config,
-        )
+        ):
+            failed_updates.append(f"{subscription.id} (domain={subscription.domain}, model={subscription.model.value})")
     
     for domain in subs_review.domains_without_message_subscription:
         reseller = domain_to_reseller.get(domain)
         if not reseller:
             print(f"Warning: Could not find reseller for domain {domain}, skipping message subscription creation")
             continue
-        create_subscription(
+        sub_id = create_subscription(
             client,
             SubscriptionModel.MESSAGE,
             domain,
@@ -1710,13 +1768,15 @@ def main(context: Optional[ProcessingContext] = None):
             subscription_expires,
             config,
         )
+        if sub_id is None:
+            failed_creates.append(f"message for domain={domain}")
     
     for domain in subs_review.domains_without_messagesession_subscription:
         reseller = domain_to_reseller.get(domain)
         if not reseller:
             print(f"Warning: Could not find reseller for domain {domain}, skipping messagesession subscription creation")
             continue
-        create_subscription(
+        sub_id = create_subscription(
             client,
             SubscriptionModel.MESSAGE_SESSION,
             domain,
@@ -1724,6 +1784,25 @@ def main(context: Optional[ProcessingContext] = None):
             user_scope,
             subscription_expires,
             config,
+        )
+        if sub_id is None:
+            failed_creates.append(f"messagesession for domain={domain}")
+
+    if failed_deletes or failed_updates or failed_creates:
+        parts: list[str] = []
+        if failed_deletes:
+            parts.append(f"delete failures ({len(failed_deletes)}): {_format_list_preview(failed_deletes)}")
+        if failed_updates:
+            parts.append(f"update failures ({len(failed_updates)}): {_format_list_preview(failed_updates)}")
+        if failed_creates:
+            parts.append(f"create failures ({len(failed_creates)}): {_format_list_preview(failed_creates)}")
+        failure_summary = "; ".join(parts)
+
+        cb_cfg = callback_config_from_config(config)
+        send_script_log(
+            callback_config=cb_cfg,
+            level="ERROR",
+            message=f"Subscription mutation errors during APPLY_SUBSCRIPTION_CHANGES: {failure_summary}",
         )
 
     set_stage(context, ProcessingStage.REFETCH_SUBSCRIPTIONS)
@@ -1810,3 +1889,16 @@ if __name__ == "__main__":
             print("[WARN] No callback config available; cannot send remote error log (stdout has details)")
 
         raise
+    else:
+        print("[INFO] Subscriptions script completed successfully")
+        if callback_cfg is not None:
+            try:
+                ok = send_script_log(
+                    callback_config=callback_cfg,
+                    level="INFO",
+                    message="Subscriptions script completed successfully",
+                )
+                if not ok:
+                    print("[WARN] Remote completion log failed")
+            except Exception as completion_e:
+                print(f"[WARN] Remote completion log threw exception: {completion_e}")
