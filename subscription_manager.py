@@ -1416,6 +1416,29 @@ def _build_subscription_body(
     }
 
 
+def _sanitize_subscription_body_for_log(json_body: dict, config: Config) -> dict:
+    """
+    Return a shallow copy of the subscription body suitable for logging.
+
+    The `post-url` field embeds the callback password as a query parameter,
+    so we mask both the URL-encoded and raw forms before sending the body
+    to any log destination (stdout or remote script-log endpoint).
+    """
+    sanitized = dict(json_body)
+    post_url = sanitized.get("post-url")
+    if isinstance(post_url, str) and config.callback_password:
+        encoded_password = urllib.parse.quote(config.callback_password, safe="")
+        sanitized["post-url"] = (
+            post_url.replace(encoded_password, "****").replace(config.callback_password, "****")
+        )
+    return sanitized
+
+
+def _format_subscription_body_for_log(json_body: dict, config: Config) -> str:
+    """Format a subscription body as a sanitized single-line JSON string for logs."""
+    return json.dumps(_sanitize_subscription_body_for_log(json_body, config), sort_keys=True)
+
+
 _SUBSCRIPTION_CREATE_MONO_TIMES: list[float] = []
 _SUBSCRIPTION_CREATE_MAX_PER_SECOND = 3
 
@@ -1465,9 +1488,25 @@ def create_subscription(
             encoded_password = urllib.parse.quote(config.callback_password, safe="")
             response_for_log = str(response).replace(encoded_password, "****").replace(config.callback_password, "****")
             print(f"Response: {response_for_log}")
+            failure_reason = f"subscription id not found in response: {response_for_log}"
     else:
         print(f"Error: Empty or failed response from {model.value} subscription request")
-    
+        failure_reason = "empty or failed response from create request"
+
+    # Per-failure remote log: include the full attempted state so the server-side
+    # log captures every field value the script tried to apply for this domain.
+    sanitized_body = _format_subscription_body_for_log(json_body, config)
+    print(f"[CREATE_FAILURE] Failed state for domain={domain} model={model.value}: {sanitized_body}")
+    send_script_log(
+        callback_config=callback_config_from_config(config),
+        level="ERROR",
+        message=(
+            f"Failed to create {model.value} subscription for domain={domain} "
+            f"(reseller={reseller}, user-scope={user_scope}): {failure_reason}. "
+            f"Attempted state: {sanitized_body}"
+        ),
+    )
+
     return None
 
 
@@ -1489,9 +1528,27 @@ def update_subscription(
     if success:
         print(f"{subscription.model.value} subscription {subscription.id} updated successfully")
         return True
-    else:
-        print(f"Error: Empty or failed response from {subscription.model.value} subscription update request")
-        return False
+
+    print(f"Error: Empty or failed response from {subscription.model.value} subscription update request")
+
+    # Per-failure remote log: include the full attempted state so the server-side
+    # log captures every field value the script tried to apply for this subscription.
+    sanitized_body = _format_subscription_body_for_log(json_body, config)
+    print(
+        f"[UPDATE_FAILURE] Failed state for id={subscription.id} "
+        f"domain={subscription.domain} model={subscription.model.value}: {sanitized_body}"
+    )
+    send_script_log(
+        callback_config=callback_config_from_config(config),
+        level="ERROR",
+        message=(
+            f"Failed to update {subscription.model.value} subscription id={subscription.id} "
+            f"(domain={subscription.domain}, reseller={reseller}, user-scope={user_scope}). "
+            f"Attempted state: {sanitized_body}"
+        ),
+    )
+
+    return False
 
 
 def delete_subscription(client: ApiClient, subscription_id: str) -> bool:
