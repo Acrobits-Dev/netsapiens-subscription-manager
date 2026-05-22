@@ -40,6 +40,7 @@ class ProcessingStage(Enum):
     REFETCH_SUBSCRIPTIONS = "REFETCH_SUBSCRIPTIONS"
     BUILD_STATUS_REPORT = "BUILD_STATUS_REPORT"
     SEND_STATUS_REPORT = "SEND_STATUS_REPORT"
+    RECREATE_FAILING_SUBSCRIPTIONS = "RECREATE_FAILING_SUBSCRIPTIONS"
 
 
 @dataclass
@@ -315,6 +316,7 @@ class ErrorCode(Enum):
     SUBSCRIPTIONS_RETRIEVAL_FAILURE = "SUBSCRIPTIONS_RETRIEVAL_FAILURE"
     SUBSCRIPTION_MUTATION_FAILURE = "SUBSCRIPTION_MUTATION_FAILURE"
     STATUS_REPORT_SEND_FAILURE = "STATUS_REPORT_SEND_FAILURE"
+    FAILING_SUBSCRIPTIONS_RECREATION_FAILURE = "FAILING_SUBSCRIPTIONS_RECREATION_FAILURE"
     UNHANDLED_EXCEPTION = "UNHANDLED_EXCEPTION"
 
 
@@ -332,6 +334,8 @@ def _infer_error_code(stage: ProcessingStage) -> ErrorCode:
         return ErrorCode.SUBSCRIPTION_MUTATION_FAILURE
     if stage == ProcessingStage.SEND_STATUS_REPORT:
         return ErrorCode.STATUS_REPORT_SEND_FAILURE
+    if stage == ProcessingStage.RECREATE_FAILING_SUBSCRIPTIONS:
+        return ErrorCode.FAILING_SUBSCRIPTIONS_RECREATION_FAILURE
     return ErrorCode.UNHANDLED_EXCEPTION
 
 
@@ -544,6 +548,15 @@ class ApiClient:
     def get(self, path: str) -> Optional[dict]:
         """Make a GET request with automatic authentication."""
         return self._make_request(path, method="GET")
+
+    def get_with_status(self, path: str) -> tuple[bool, Optional[dict]]:
+        """
+        Make a GET request, returning success status.
+
+        Returns:
+            tuple of (success: bool, response_data: Optional[dict])
+        """
+        return self._make_request_with_status(path, method="GET")
     
     def post_json(self, path: str, body: dict) -> Optional[dict]:
         """Make a POST request with JSON body and automatic authentication."""
@@ -724,6 +737,29 @@ class SubscriptionReviewResult:
     domains_without_message_subscription: list[str]
     domains_without_messagesession_subscription: list[str]
     missing_allowed_domains: list[str]
+
+
+# Mirrors NetsapiensFailingSubscriptionDto returned by the callback host
+# GET /netsapiens/callbacks/{cloudId}/failing-subscriptions endpoint.
+# Only the fields actually consumed by the recreation flow are mapped.
+@dataclass
+class FailingSubscription:
+    cloud_id: str
+    domain: str
+    subscription_id: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "FailingSubscription":
+        if not isinstance(data, dict):
+            raise TypeError(f"Expected dict, got {type(data).__name__}")
+        for required_key in ("cloudId", "domain", "subscriptionId"):
+            if required_key not in data:
+                raise ValueError(f"Missing '{required_key}' in failing subscription payload: {data}")
+        return cls(
+            cloud_id=data["cloudId"],
+            domain=data["domain"],
+            subscription_id=data["subscriptionId"],
+        )
 
 # ===============================================
 # Status Report Data Classes
@@ -1561,6 +1597,238 @@ def delete_subscription(client: ApiClient, subscription_id: str) -> bool:
     return success
 
 # ===============================================
+# Failing Subscriptions Recreation
+# ===============================================
+
+def fetch_failing_subscriptions(callback_config: CallbackConfig) -> Optional[list[FailingSubscription]]:
+    """
+    Fetch the list of failing subscriptions tracked on the callback host.
+
+    GET to: {callback_host}/netsapiens/callbacks/{cloud_id}/failing-subscriptions?password={callback_password}
+
+    Returns the parsed list on success, None on transport/HTTP failure.
+    """
+    encoded_password = urllib.parse.quote(callback_config.callback_password, safe="")
+    path = (
+        f"/netsapiens/callbacks/{callback_config.cloud_id}/failing-subscriptions"
+        f"?password={encoded_password}"
+    )
+
+    callback_client = ApiClient(callback_config.callback_host)
+    print(
+        f"Fetching failing subscriptions from "
+        f"{callback_config.callback_host}/netsapiens/callbacks/{callback_config.cloud_id}/failing-subscriptions..."
+    )
+
+    success, response = callback_client.get_with_status(path)
+    if not success:
+        print("Failed to fetch failing subscriptions")
+        return None
+
+    if response is None:
+        return []
+
+    if not isinstance(response, list):
+        raise TypeError(f"Expected list of failing subscriptions, got {type(response).__name__}")
+
+    return [FailingSubscription.from_dict(item) for item in response]
+
+
+def mark_failing_subscription_deleted(
+    callback_config: CallbackConfig,
+    subscription_id: str
+) -> bool:
+    """
+    Mark a single failing subscription record as deleted on the callback host.
+
+    DELETE to: {callback_host}/netsapiens/callbacks/{cloud_id}/failing-subscriptions
+                ?subscriptionId={subscription_id}&password={callback_password}
+
+    The server performs a soft delete (sets the deleted flag) of the matching row.
+    """
+    encoded_password = urllib.parse.quote(callback_config.callback_password, safe="")
+    encoded_subscription_id = urllib.parse.quote(subscription_id, safe="")
+    path = (
+        f"/netsapiens/callbacks/{callback_config.cloud_id}/failing-subscriptions"
+        f"?subscriptionId={encoded_subscription_id}&password={encoded_password}"
+    )
+
+    callback_client = ApiClient(callback_config.callback_host)
+    success, _ = callback_client.delete_with_status(path)
+    if success:
+        print(f"Failing subscription record {subscription_id} marked as deleted on callback host")
+    else:
+        print(f"Error: Failed to mark failing subscription {subscription_id} as deleted on callback host")
+    return success
+
+
+def recreate_failing_subscriptions(
+    client: ApiClient,
+    config: Config,
+    domain_to_reseller: dict[str, str],
+    current_subscriptions: list[Subscription],
+    user_scope: str,
+    subscription_expires: str,
+) -> None:
+    """
+    Fetch failing subscriptions from the callback host and recreate each on NetSapiens.
+
+    For every failing record returned by the callback host this function tries to:
+      1. Delete the existing subscription from NetSapiens (looked up by subscription id
+         in the previously fetched current NS subscriptions).
+      2. Create a new subscription for the same (domain, model) using the existing helper.
+      3. Mark the failing subscription record on the callback host as soft-deleted.
+
+    A successful recreation emits an INFO log to the subscriptions-script-log endpoint;
+    per-record failures are caught, logged as ERROR, and do not stop processing of
+    remaining records.
+    """
+    callback_config = callback_config_from_config(config)
+
+    failing_subscriptions = fetch_failing_subscriptions(callback_config)
+    if failing_subscriptions is None:
+        send_script_log(
+            callback_config=callback_config,
+            level="ERROR",
+            message=(
+                f"Failed to fetch failing subscriptions for cloudId={config.cloud_id} "
+                f"from callback host {config.callback_host}"
+            ),
+        )
+        return
+
+    print(f"Found {len(failing_subscriptions)} failing subscriptions on callback host")
+    if not failing_subscriptions:
+        return
+
+    subscriptions_by_id = {subscription.id: subscription for subscription in current_subscriptions}
+
+    for failing_subscription in failing_subscriptions:
+        try:
+            _recreate_failing_subscription(
+                client=client,
+                config=config,
+                callback_config=callback_config,
+                subscriptions_by_id=subscriptions_by_id,
+                domain_to_reseller=domain_to_reseller,
+                failing_subscription=failing_subscription,
+                user_scope=user_scope,
+                subscription_expires=subscription_expires,
+            )
+        except Exception as recreate_error:
+            stack_trace = _format_exception_stack_trace(recreate_error)
+            print(
+                f"[FAILING_SUB_RECREATE] Failed to recreate failing subscription "
+                f"subscriptionId={failing_subscription.subscription_id}, "
+                f"domain={failing_subscription.domain}: {recreate_error}"
+            )
+            print(stack_trace)
+            send_script_log(
+                callback_config=callback_config,
+                level="ERROR",
+                message=(
+                    f"Failed to recreate failing subscription "
+                    f"subscriptionId={failing_subscription.subscription_id}, "
+                    f"domain={failing_subscription.domain}: {recreate_error}"
+                ),
+                callstack=stack_trace,
+            )
+
+
+def _recreate_failing_subscription(
+    client: ApiClient,
+    config: Config,
+    callback_config: CallbackConfig,
+    subscriptions_by_id: dict[str, Subscription],
+    domain_to_reseller: dict[str, str],
+    failing_subscription: FailingSubscription,
+    user_scope: str,
+    subscription_expires: str,
+) -> None:
+    """
+    Recreate a single failing subscription on NetSapiens and mark the failing record as deleted.
+
+    If the underlying NS subscription cannot be located (e.g., already deleted by a previous
+    cleanup), a WARN is logged and the failing record is left untouched so an operator
+    can investigate.
+    """
+    existing_subscription = subscriptions_by_id.get(failing_subscription.subscription_id)
+    if existing_subscription is None:
+        print(
+            f"[FAILING_SUB_RECREATE] Skipping recreation: NS subscription "
+            f"{failing_subscription.subscription_id} not found in current NetSapiens snapshot "
+            f"(domain={failing_subscription.domain})"
+        )
+        send_script_log(
+            callback_config=callback_config,
+            level="WARN",
+            message=(
+                f"Cannot recreate failing subscription "
+                f"subscriptionId={failing_subscription.subscription_id} "
+                f"(domain={failing_subscription.domain}): "
+                f"NS subscription not found in current snapshot, model cannot be determined"
+            ),
+        )
+        return
+
+    reseller = domain_to_reseller.get(existing_subscription.domain)
+    if not reseller:
+        raise RuntimeError(
+            f"Cannot determine reseller for domain={existing_subscription.domain} "
+            f"while recreating failing subscription {failing_subscription.subscription_id}"
+        )
+
+    if not delete_subscription(client, existing_subscription.id):
+        raise RuntimeError(
+            f"Failed to delete subscription {existing_subscription.id} from NetSapiens "
+            f"(domain={existing_subscription.domain}, model={existing_subscription.model.value})"
+        )
+
+    new_subscription_id = create_subscription(
+        client=client,
+        model=existing_subscription.model,
+        domain=existing_subscription.domain,
+        reseller=reseller,
+        user_scope=user_scope,
+        subscription_expires=subscription_expires,
+        config=config,
+    )
+    if new_subscription_id is None:
+        raise RuntimeError(
+            f"Failed to create new subscription for domain={existing_subscription.domain}, "
+            f"model={existing_subscription.model.value} "
+            f"after deleting old subscription {existing_subscription.id}"
+        )
+
+    print(
+        f"Recreated failing subscription: oldId={failing_subscription.subscription_id}, "
+        f"newId={new_subscription_id}, domain={existing_subscription.domain}, "
+        f"model={existing_subscription.model.value}"
+    )
+    send_script_log(
+        callback_config=callback_config,
+        level="INFO",
+        message=(
+            f"Recreated failing subscription: oldSubscriptionId={failing_subscription.subscription_id}, "
+            f"newSubscriptionId={new_subscription_id}, domain={existing_subscription.domain}, "
+            f"model={existing_subscription.model.value}"
+        ),
+    )
+
+    if not mark_failing_subscription_deleted(callback_config, failing_subscription.subscription_id):
+        send_script_log(
+            callback_config=callback_config,
+            level="WARN",
+            message=(
+                f"Recreated subscription but failed to mark failing record as deleted on callback host: "
+                f"oldSubscriptionId={failing_subscription.subscription_id}, "
+                f"newSubscriptionId={new_subscription_id}, domain={existing_subscription.domain}, "
+                f"model={existing_subscription.model.value}"
+            ),
+        )
+
+
+# ===============================================
 # Paginated API fetch helper
 # ===============================================
 
@@ -1883,6 +2151,17 @@ def main(context: Optional[ProcessingContext] = None):
     set_stage(context, ProcessingStage.SEND_STATUS_REPORT)
     if not send_status_report(report=report, config=config):
         raise RuntimeError("Failed to send status report")
+
+    set_stage(context, ProcessingStage.RECREATE_FAILING_SUBSCRIPTIONS)
+    print("\nRecreating failing subscriptions reported by callback host...")
+    recreate_failing_subscriptions(
+        client=client,
+        config=config,
+        domain_to_reseller=domain_to_reseller,
+        current_subscriptions=updated_subscriptions,
+        user_scope=user_scope,
+        subscription_expires=subscription_expires,
+    )
 
 if __name__ == "__main__":
     ctx = ProcessingContext()
