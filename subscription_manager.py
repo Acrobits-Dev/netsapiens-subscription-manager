@@ -1600,6 +1600,12 @@ def delete_subscription(client: ApiClient, subscription_id: str) -> bool:
 # Failing Subscriptions Recreation
 # ===============================================
 
+# Defensive pause between the delete and the create call on NetSapiens for a
+# recreated failing subscription, giving NS time to release the deleted
+# subscription before the new one is registered for the same (domain, model).
+_FAILING_SUB_DELETE_TO_CREATE_DELAY_SECONDS = 5.0
+
+
 def fetch_failing_subscriptions(callback_config: CallbackConfig) -> Optional[list[FailingSubscription]]:
     """
     Fetch the list of failing subscriptions tracked on the callback host.
@@ -1751,6 +1757,15 @@ def _recreate_failing_subscription(
     If the underlying NS subscription cannot be located (e.g., already deleted by a previous
     cleanup), a WARN is logged and the failing record is left untouched so an operator
     can investigate.
+
+    Once the old subscription has been successfully deleted from NetSapiens the failing
+    record is always marked as deleted on the callback host, even if the subsequent
+    create call fails. After the delete the old subscription id no longer exists on
+    NetSapiens, so the failing record is permanently stale; leaving it in place would
+    cause it to be retried indefinitely on every subsequent script run without any
+    possibility of being resolved. APPLY_SUBSCRIPTION_CHANGES, which runs right after
+    this stage on a freshly re-fetched subscriptions snapshot, will pick up the
+    missing (domain, model) and create a replacement subscription if needed.
     """
     existing_subscription = subscriptions_by_id.get(failing_subscription.subscription_id)
     if existing_subscription is None:
@@ -1784,48 +1799,51 @@ def _recreate_failing_subscription(
             f"(domain={existing_subscription.domain}, model={existing_subscription.model.value})"
         )
 
-    new_subscription_id = create_subscription(
-        client=client,
-        model=existing_subscription.model,
-        domain=existing_subscription.domain,
-        reseller=reseller,
-        user_scope=user_scope,
-        subscription_expires=subscription_expires,
-        config=config,
-    )
-    if new_subscription_id is None:
-        raise RuntimeError(
-            f"Failed to create new subscription for domain={existing_subscription.domain}, "
-            f"model={existing_subscription.model.value} "
-            f"after deleting old subscription {existing_subscription.id}"
+    try:
+        time.sleep(_FAILING_SUB_DELETE_TO_CREATE_DELAY_SECONDS)
+
+        new_subscription_id = create_subscription(
+            client=client,
+            model=existing_subscription.model,
+            domain=existing_subscription.domain,
+            reseller=reseller,
+            user_scope=user_scope,
+            subscription_expires=subscription_expires,
+            config=config,
         )
+        if new_subscription_id is None:
+            raise RuntimeError(
+                f"Failed to create new subscription for domain={existing_subscription.domain}, "
+                f"model={existing_subscription.model.value} "
+                f"after deleting old subscription {existing_subscription.id}"
+            )
 
-    print(
-        f"Recreated failing subscription: oldId={failing_subscription.subscription_id}, "
-        f"newId={new_subscription_id}, domain={existing_subscription.domain}, "
-        f"model={existing_subscription.model.value}"
-    )
-    send_script_log(
-        callback_config=callback_config,
-        level="INFO",
-        message=(
-            f"Recreated failing subscription: oldSubscriptionId={failing_subscription.subscription_id}, "
-            f"newSubscriptionId={new_subscription_id}, domain={existing_subscription.domain}, "
+        print(
+            f"Recreated failing subscription: oldId={failing_subscription.subscription_id}, "
+            f"newId={new_subscription_id}, domain={existing_subscription.domain}, "
             f"model={existing_subscription.model.value}"
-        ),
-    )
-
-    if not mark_failing_subscription_deleted(callback_config, failing_subscription.subscription_id):
+        )
         send_script_log(
             callback_config=callback_config,
-            level="WARN",
+            level="INFO",
             message=(
-                f"Recreated subscription but failed to mark failing record as deleted on callback host: "
-                f"oldSubscriptionId={failing_subscription.subscription_id}, "
+                f"Recreated failing subscription: oldSubscriptionId={failing_subscription.subscription_id}, "
                 f"newSubscriptionId={new_subscription_id}, domain={existing_subscription.domain}, "
                 f"model={existing_subscription.model.value}"
             ),
         )
+    finally:
+        if not mark_failing_subscription_deleted(callback_config, failing_subscription.subscription_id):
+            send_script_log(
+                callback_config=callback_config,
+                level="WARN",
+                message=(
+                    f"Failed to mark failing record as deleted on callback host after deleting NS subscription: "
+                    f"oldSubscriptionId={failing_subscription.subscription_id}, "
+                    f"domain={existing_subscription.domain}, "
+                    f"model={existing_subscription.model.value}"
+                ),
+            )
 
 
 # ===============================================
@@ -2018,6 +2036,28 @@ def main(context: Optional[ProcessingContext] = None):
         raise RuntimeError("Failed to fetch subscriptions: Empty response")
     print(f"Found {len(subscriptions)} subscriptions for callback host {config.callback_host}:")
 
+    # Calculate expiration date (20 years from now) — used by both the failing
+    # subscriptions recreation stage below and the subscription mutation stage later.
+    subscription_expires = (datetime.now(timezone.utc) + timedelta(days=365 * 20)).strftime("%Y-%m-%d %H:%M:%S")
+
+    set_stage(context, ProcessingStage.RECREATE_FAILING_SUBSCRIPTIONS)
+    print("\nRecreating failing subscriptions reported by callback host...")
+    recreate_failing_subscriptions(
+        client=client,
+        config=config,
+        domain_to_reseller=domain_to_reseller,
+        current_subscriptions=subscriptions,
+        user_scope=user_scope,
+        subscription_expires=subscription_expires,
+    )
+
+    set_stage(context, ProcessingStage.FETCH_SUBSCRIPTIONS)
+    print("\nRe-fetching subscriptions after failing subscription recreation...")
+    subscriptions = fetch_subscriptions(client, callback_host=config.callback_host)
+    if subscriptions is None:
+        raise RuntimeError("Failed to re-fetch subscriptions after failing subscription recreation")
+    print(f"Found {len(subscriptions)} subscriptions for callback host {config.callback_host} after recreation")
+
     subs_review = review_subscriptions(
         subscriptions,
         domain_infos,
@@ -2047,9 +2087,6 @@ def main(context: Optional[ProcessingContext] = None):
         print(f"Deleting subscription: {subscription.id}")
         if not delete_subscription(client, subscription.id):
             failed_deletes.append(subscription.id)
-    
-    # Calculate expiration date (20 years from now)
-    subscription_expires = (datetime.now(timezone.utc) + timedelta(days=365 * 20)).strftime("%Y-%m-%d %H:%M:%S")
 
     # Merge subs that need re-posting (invalid active server OR outdated post-url path)
     # and dedup by id so a sub flagged by both conditions is only updated once.
@@ -2151,17 +2188,6 @@ def main(context: Optional[ProcessingContext] = None):
     set_stage(context, ProcessingStage.SEND_STATUS_REPORT)
     if not send_status_report(report=report, config=config):
         raise RuntimeError("Failed to send status report")
-
-    set_stage(context, ProcessingStage.RECREATE_FAILING_SUBSCRIPTIONS)
-    print("\nRecreating failing subscriptions reported by callback host...")
-    recreate_failing_subscriptions(
-        client=client,
-        config=config,
-        domain_to_reseller=domain_to_reseller,
-        current_subscriptions=updated_subscriptions,
-        user_scope=user_scope,
-        subscription_expires=subscription_expires,
-    )
 
 if __name__ == "__main__":
     ctx = ProcessingContext()
