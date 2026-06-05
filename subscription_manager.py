@@ -93,6 +93,7 @@ class Config:
     editable_version_domain: str
     allowed_domains: list[str]
     disallowed_domains: list[str]
+    resellers: list[str]
 
 
 @dataclass
@@ -158,7 +159,17 @@ def load_config_from_env() -> Config:
         EDITABLE_VERSION_DOMAIN: Domain for editable version (default: "")
         ALLOWED_DOMAINS: Comma-separated list of allowed domains (default: "")
         DISALLOWED_DOMAINS: Comma-separated list of disallowed domains (default: "")
-    
+        NS_RESELLERS: Comma-separated list of reseller names used to select
+            domains by reseller (default: "")
+
+    Domain selection rules:
+        - ALLOWED_DOMAINS and DISALLOWED_DOMAINS are mutually exclusive.
+        - ALLOWED_DOMAINS and NS_RESELLERS are mutually exclusive.
+        - NS_RESELLERS may be combined with DISALLOWED_DOMAINS to further
+          exclude individual domains from the reseller-selected set.
+        - When neither ALLOWED_DOMAINS nor NS_RESELLERS is set, the existing
+          allow-all / DISALLOWED_DOMAINS behavior is preserved.
+
     Schemes default to https if omitted; trailing slashes are removed.
     """
     ns_api_host = os.environ.get("NS_API_HOST")
@@ -181,9 +192,12 @@ def load_config_from_env() -> Config:
     
     allowed_domains = _parse_comma_separated_list(os.environ.get("ALLOWED_DOMAINS", ""))
     disallowed_domains = _parse_comma_separated_list(os.environ.get("DISALLOWED_DOMAINS", ""))
+    resellers = _parse_comma_separated_list(os.environ.get("NS_RESELLERS", ""))
     
     if allowed_domains and disallowed_domains:
         raise RuntimeError("ALLOWED_DOMAINS and DISALLOWED_DOMAINS cannot be configured at the same time")
+    if allowed_domains and resellers:
+        raise RuntimeError("ALLOWED_DOMAINS and NS_RESELLERS cannot be configured at the same time")
     
     return Config(
         ns_api_host=_normalize_base_url(ns_api_host),
@@ -193,6 +207,7 @@ def load_config_from_env() -> Config:
         editable_version_domain=os.environ.get("EDITABLE_VERSION_DOMAIN", ""),
         allowed_domains=allowed_domains,
         disallowed_domains=disallowed_domains,
+        resellers=resellers,
     )
 
 
@@ -798,6 +813,7 @@ class ExclusionReason(Enum):
     """Reason why a domain was excluded from coverage tracking."""
     DISALLOWED_DOMAIN = "DISALLOWED_DOMAIN"      # Domain is in disallowed_domains list
     NOT_IN_ALLOWED_LIST = "NOT_IN_ALLOWED_LIST"  # allowed_domains is configured but domain is not in it
+    NOT_IN_SELECTED_RESELLERS = "NOT_IN_SELECTED_RESELLERS"  # resellers is configured but domain's reseller is not in it
 
 
 class SubscriptionIssue(Enum):
@@ -928,6 +944,7 @@ class StatusReportConfiguration:
     callback_host: str
     allowed_domains: list[str]
     disallowed_domains: list[str]
+    resellers: list[str]
     editable_version_domain: str
 
     def to_dict(self) -> dict:
@@ -936,6 +953,7 @@ class StatusReportConfiguration:
             "callback_host": self.callback_host,
             "allowed_domains": self.allowed_domains,
             "disallowed_domains": self.disallowed_domains,
+            "resellers": self.resellers,
             "editable_version_domain": self.editable_version_domain
         }
 
@@ -1025,6 +1043,73 @@ def _compute_effective_domains(
     return effective_allowed, effective_disallowed
 
 
+def _domain_exclusion_reason(
+    domain_info: DomainInfo,
+    config: Config,
+    effective_allowed_domains: list[str],
+    effective_disallowed_domains: list[str],
+) -> Optional[ExclusionReason]:
+    """
+    Single source of truth deciding whether a domain is eligible for subscription
+    management, and if not, why.
+
+    Returns None when the domain is selected (eligible), or the ExclusionReason
+    explaining why it is excluded.
+
+    Selection precedence (mirrors the mutually-exclusive config validation in
+    load_config_from_env):
+        1. editable_version_domain is always eligible.
+        2. ALLOWED_DOMAINS configured  -> domain must be in the allowed list.
+        3. NS_RESELLERS configured     -> domain's reseller must be in the list
+           (exact, case-sensitive); a domain may still be excluded by
+           DISALLOWED_DOMAINS, which can be combined with NS_RESELLERS.
+        4. DISALLOWED_DOMAINS configured -> domain must not be in the disallowed list.
+        5. Otherwise every domain is eligible (allow-all).
+    """
+    if config.editable_version_domain and domain_info.domain == config.editable_version_domain:
+        return None
+
+    if config.allowed_domains:
+        if domain_info.domain not in effective_allowed_domains:
+            return ExclusionReason.NOT_IN_ALLOWED_LIST
+        return None
+
+    if config.resellers:
+        if domain_info.reseller not in config.resellers:
+            return ExclusionReason.NOT_IN_SELECTED_RESELLERS
+        if config.disallowed_domains and domain_info.domain in effective_disallowed_domains:
+            return ExclusionReason.DISALLOWED_DOMAIN
+        return None
+
+    if config.disallowed_domains:
+        if domain_info.domain in effective_disallowed_domains:
+            return ExclusionReason.DISALLOWED_DOMAIN
+        return None
+
+    return None
+
+
+def _compute_selected_domain_names(domain_infos: list[DomainInfo], config: Config) -> list[str]:
+    """
+    Return the list of domain names (from the API domains) that are eligible for
+    subscription management under the current config.
+
+    Uses _domain_exclusion_reason as the single source of truth so that
+    review_subscriptions and build_status_report stay consistent across the
+    allowed / reseller / disallowed / allow-all selection modes.
+    """
+    effective_allowed_domains, effective_disallowed_domains = _compute_effective_domains(
+        config.allowed_domains, config.disallowed_domains, config.editable_version_domain
+    )
+    return [
+        domain_info.domain
+        for domain_info in domain_infos
+        if _domain_exclusion_reason(
+            domain_info, config, effective_allowed_domains, effective_disallowed_domains
+        ) is None
+    ]
+
+
 def _find_subscription_by_domain_and_model(
     subscriptions: list[Subscription],
     domain: str,
@@ -1047,7 +1132,9 @@ def review_subscriptions(
     
     - Subscriptions not targeting our callback host (config.callback_host) are filtered out.
     - Subscriptions in domains not returned by the API are marked as unknown.
-    - Allowed/disallowed domains are mutually exclusive; subscriptions outside the allowed list (or inside the disallowed list) are surfaced.
+    - Domain selection follows the active mode (allowed list, NS_RESELLERS, disallowed
+      list, or allow-all) via _domain_exclusion_reason; subscriptions for known domains
+      that are not selected by the active mode are surfaced for removal.
     - For the remaining subscriptions, abnormal `current_active_server` values are flagged
       (empty, or scheme-prefixed such as "https://host" — see _is_active_server_invalid).
     - For each relevant domain, presence of both `message` and `messagesession` subscriptions is verified.
@@ -1064,40 +1151,39 @@ def review_subscriptions(
     ]
     
     allowed_domains = config.allowed_domains
-    disallowed_domains = config.disallowed_domains
     editable_version_domain = config.editable_version_domain
     
     # Extract domain names for membership checks
     domain_names = [info.domain for info in domain_infos]
     
     allowed_domains_configured = len(allowed_domains) > 0
-    disallowed_domains_configured = len(disallowed_domains) > 0
 
-    missing_allowed_domains: list[str] = []
-    effective_allowed_domains, effective_disallowed_domains = _compute_effective_domains(
-        allowed_domains, disallowed_domains, editable_version_domain
+    effective_allowed_domains, _effective_disallowed_domains = _compute_effective_domains(
+        allowed_domains, config.disallowed_domains, editable_version_domain
     )
+
+    # Domains eligible for subscription management under the active selection mode
+    # (allowed / reseller / disallowed / allow-all). Single source of truth shared
+    # with build_status_report via _domain_exclusion_reason.
+    selected_domain_names = _compute_selected_domain_names(domain_infos, config)
+    selected_domain_names_set = set(selected_domain_names)
 
     # Filter out subscriptions that are in unknown domains, not sure if this can happen, but just in case.
     subscriptions_in_unknown_domains = [
         subscription for subscription in subscriptions if subscription.domain not in domain_names
     ]
 
+    # Subscriptions whose domain is known but not selected by the active mode are
+    # out of scope and must be removed.
+    subscriptions_in_disallowed_domains = [
+        subscription
+        for subscription in subscriptions
+        if subscription.domain in domain_names and subscription.domain not in selected_domain_names_set
+    ]
+
+    missing_allowed_domains: list[str] = []
     if allowed_domains_configured:
-        subscriptions_in_disallowed_domains = [
-            subscription
-            for subscription in subscriptions
-            if subscription.domain in domain_names and subscription.domain not in effective_allowed_domains
-        ]
         missing_allowed_domains = [domain for domain in effective_allowed_domains if domain not in domain_names]
-    elif disallowed_domains_configured:
-        subscriptions_in_disallowed_domains = [
-            subscription
-            for subscription in subscriptions
-            if subscription.domain in domain_names and subscription.domain in effective_disallowed_domains
-        ]
-    else:
-        subscriptions_in_disallowed_domains = []
 
     excluded_subscription_ids = {
         subscription.id for subscription in (subscriptions_in_disallowed_domains + subscriptions_in_unknown_domains)
@@ -1119,15 +1205,10 @@ def review_subscriptions(
     domains_without_message_subscription: list[str] = []
     domains_without_messagesession_subscription: list[str] = []
 
-    # Filter domain names based on allowed/disallowed configuration
-    filtered_domain_names = domain_names
-    if allowed_domains_configured:
-        filtered_domain_names = [domain for domain in domain_names if domain in effective_allowed_domains]
-    elif disallowed_domains_configured:
-        filtered_domain_names = [domain for domain in domain_names if domain not in effective_disallowed_domains]
-    # ensure editable_version_domain is still checked when not explicitly allowed
-    if editable_version_domain and editable_version_domain in domain_names and editable_version_domain not in filtered_domain_names:
-        filtered_domain_names.append(editable_version_domain)
+    # Only the selected domains are checked for missing subscriptions. The
+    # editable_version_domain is already treated as selected by
+    # _domain_exclusion_reason, so no special-casing is needed here.
+    filtered_domain_names = selected_domain_names
 
     for domain in filtered_domain_names:
         # find the messagesession subscription for the domain
@@ -1183,10 +1264,6 @@ def build_status_report(
     ]
     
     domain_names = [info.domain for info in domain_infos]
-    domain_to_reseller = {info.domain: info.reseller for info in domain_infos}
-    
-    allowed_domains_configured = len(config.allowed_domains) > 0
-    disallowed_domains_configured = len(config.disallowed_domains) > 0
     
     effective_allowed_domains, effective_disallowed_domains = _compute_effective_domains(
         config.allowed_domains, config.disallowed_domains, config.editable_version_domain
@@ -1202,35 +1279,20 @@ def build_status_report(
     partially_covered_count = 0
     uncovered_count = 0
     
-    # Compute effective domain list (domains that should be processed)
-    effective_domain_names: list[str] = []
-    if allowed_domains_configured:
-        effective_domain_names = [d for d in domain_names if d in effective_allowed_domains]
-    elif disallowed_domains_configured:
-        effective_domain_names = [d for d in domain_names if d not in effective_disallowed_domains]
-    else:
-        effective_domain_names = domain_names.copy()
-    
-    # Ensure editable_version_domain is included if it exists in API domains
-    if config.editable_version_domain and config.editable_version_domain in domain_names:
-        if config.editable_version_domain not in effective_domain_names:
-            effective_domain_names.append(config.editable_version_domain)
+    # Compute effective domain list (domains that should be processed) using the
+    # same selection source of truth as review_subscriptions.
+    effective_domain_names = _compute_selected_domain_names(domain_infos, config)
     
     # Process each domain from the API
     for domain_info in domain_infos:
         domain = domain_info.domain
         reseller = domain_info.reseller
         
-        # Determine if domain is excluded
-        is_excluded = False
-        exclusion_reason: Optional[ExclusionReason] = None
-        
-        if allowed_domains_configured and domain not in effective_allowed_domains:
-            is_excluded = True
-            exclusion_reason = ExclusionReason.NOT_IN_ALLOWED_LIST
-        elif disallowed_domains_configured and domain in effective_disallowed_domains:
-            is_excluded = True
-            exclusion_reason = ExclusionReason.DISALLOWED_DOMAIN
+        # Determine if domain is excluded under the active selection mode.
+        exclusion_reason = _domain_exclusion_reason(
+            domain_info, config, effective_allowed_domains, effective_disallowed_domains
+        )
+        is_excluded = exclusion_reason is not None
         
         # Find subscriptions for this domain
         message_sub = _find_subscription_by_domain_and_model(our_subscriptions, domain, SubscriptionModel.MESSAGE)
@@ -1306,6 +1368,7 @@ def build_status_report(
         callback_host=config.callback_host,
         allowed_domains=config.allowed_domains,
         disallowed_domains=config.disallowed_domains,
+        resellers=config.resellers,
         editable_version_domain=config.editable_version_domain
     )
     
