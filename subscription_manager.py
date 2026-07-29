@@ -27,6 +27,14 @@ from typing import Optional, Any, TypeVar, Callable
 
 
 # ===============================================
+# Version Constants
+# ===============================================
+
+SCRIPT_VERSION = "1.6"
+REPORT_VERSION = 2
+
+
+# ===============================================
 # Processing Context (for error/script-log reporting)
 # ===============================================
 
@@ -960,6 +968,7 @@ class StatusReportConfiguration:
 
 @dataclass
 class StatusReport:
+    script_version: str
     report_version: int
     report_timestamp: str
     cloud_id: str
@@ -970,6 +979,7 @@ class StatusReport:
 
     def to_dict(self) -> dict:
         return {
+            "script_version": self.script_version,
             "report_version": self.report_version,
             "report_timestamp": self.report_timestamp,
             "cloud_id": self.cloud_id,
@@ -1239,9 +1249,6 @@ def review_subscriptions(
 # Status Report Builder
 # ===============================================
 
-REPORT_VERSION = 2
-
-
 def build_status_report(
     subscriptions: list[Subscription],
     domain_infos: list[DomainInfo],
@@ -1383,6 +1390,7 @@ def build_status_report(
     )
     
     return StatusReport(
+        script_version=SCRIPT_VERSION,
         report_version=REPORT_VERSION,
         report_timestamp=report_timestamp,
         cloud_id=config.cloud_id,
