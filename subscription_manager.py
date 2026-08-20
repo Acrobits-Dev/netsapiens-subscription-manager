@@ -1483,8 +1483,9 @@ def _is_active_server_invalid(active_server: str) -> bool:
        (newly created, or NS lost the binding).
     2. Scheme-prefixed (e.g. "https://sipns.acme.net"): stale data left over
        from older script versions that incorrectly sent preferred-server with
-       a scheme. Re-posting with the now-correct host-only preferred-server
-       lets NS re-resolve current-active-server in the canonical format.
+       a scheme. Re-posting sends preferred-server as the host-only form of this
+       same value (scheme stripped; see _resolve_preferred_server_host), letting
+       NS re-resolve current-active-server in the canonical format.
 
     Detection of (2) relies on the literal "://" substring rather than
     urlparse's scheme field, because a bare "host:port" string can be
@@ -1495,20 +1496,58 @@ def _is_active_server_invalid(active_server: str) -> bool:
     return "://" in active_server
 
 
+def _strip_scheme_to_host(value: str) -> str:
+    """
+    Return the host-only form of a server value, stripping any scheme prefix.
+
+    "https://sipns.acme.net" -> "sipns.acme.net"; a value that is already
+    host-only ("sipns.acme.net") is returned unchanged. Scheme detection relies
+    on the literal "://" substring (consistent with _is_active_server_invalid),
+    because urlparse can misclassify a bare "host:port" string as having a scheme.
+    """
+    if "://" in value:
+        return urllib.parse.urlparse(value).netloc
+    return value
+
+
+def _resolve_preferred_server_host(current_active_server: str, config: Config) -> str:
+    """
+    Determine the host-only preferred-server value to send on a create/update.
+
+    Resolution:
+    - If current_active_server is empty/None, fall back to the host of
+      config.ns_api_host (ns_api_host is normalized with a scheme by
+      _normalize_base_url, so .netloc is always populated).
+    - Otherwise use current_active_server, stripping any scheme prefix so the
+      value stays host-only (e.g. a stale "https://sipns.acme.net" becomes
+      "sipns.acme.net"). If stripping leaves an empty host, fall back to config.
+    """
+    config_host = urllib.parse.urlparse(config.ns_api_host).netloc
+    if not current_active_server:
+        return config_host
+    return _strip_scheme_to_host(current_active_server) or config_host
+
+
 def _build_subscription_body(
     model: SubscriptionModel,
     domain: str,
     reseller: str,
     user_scope: str,
     subscription_expires: str,
-    config: Config
+    config: Config,
+    current_active_server: str = ""
 ) -> dict:
-    """Build the JSON body for subscription create/update requests."""
+    """
+    Build the JSON body for subscription create/update requests.
+
+    preferred-server is derived from current_active_server (host-only) when
+    provided, falling back to config.ns_api_host when it is empty. New creates
+    that have no existing subscription pass an empty current_active_server and
+    therefore always take preferred-server from config.
+    """
     post_url = _build_post_url(model, domain, config)
 
-    # preferred-server expects host only (no scheme); ns_api_host is normalized
-    # with a scheme by _normalize_base_url, so .netloc is always populated.
-    preferred_server_host = urllib.parse.urlparse(config.ns_api_host).netloc
+    preferred_server_host = _resolve_preferred_server_host(current_active_server, config)
 
     return {
         "post-url": post_url,
@@ -1574,10 +1613,11 @@ def create_subscription(
     reseller: str,
     user_scope: str,
     subscription_expires: str,
-    config: Config
+    config: Config,
+    current_active_server: str = ""
 ) -> Optional[str]:
     """Create a subscription and return the subscription ID."""
-    json_body = _build_subscription_body(model, domain, reseller, user_scope, subscription_expires, config)
+    json_body = _build_subscription_body(model, domain, reseller, user_scope, subscription_expires, config, current_active_server)
 
     _throttle_subscription_creates()
 
@@ -1626,7 +1666,15 @@ def update_subscription(
     config: Config
 ) -> bool:
     """Update a subscription. Returns True on success, False on failure."""
-    json_body = _build_subscription_body(subscription.model, subscription.domain, reseller, user_scope, subscription_expires, config)
+    json_body = _build_subscription_body(
+        subscription.model,
+        subscription.domain,
+        reseller,
+        user_scope,
+        subscription_expires,
+        config,
+        current_active_server=subscription.current_active_server,
+    )
     
     print(f"Updating {subscription.model.value} subscription {subscription.id}...")
     
@@ -1881,6 +1929,7 @@ def _recreate_failing_subscription(
             user_scope=user_scope,
             subscription_expires=subscription_expires,
             config=config,
+            current_active_server=existing_subscription.current_active_server,
         )
         if new_subscription_id is None:
             raise RuntimeError(
