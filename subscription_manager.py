@@ -10,10 +10,20 @@ Use cases:
     - Create new subscriptions for messaging events
     - Maintain and update subscription configurations
     - Report subscription status and health
+    - Purge all subscriptions of the callback host that follow the script's
+      post-url pattern, for any cloud id (e.g. when a customer migrates to another app)
+
+Usage:
+    subscription_manager.py                                   regular run
+    subscription_manager.py --purge-subscriptions             list subscriptions that would be purged
+    subscription_manager.py --purge-subscriptions --execute   delete them
 """
 
+import argparse
 import json
 import os
+import re
+import sys
 import time
 import traceback
 import urllib.request
@@ -30,7 +40,7 @@ from typing import Optional, Any, TypeVar, Callable
 # Version Constants
 # ===============================================
 
-SCRIPT_VERSION = "1.6"
+SCRIPT_VERSION = "2.0"
 REPORT_VERSION = 2
 
 
@@ -41,6 +51,7 @@ REPORT_VERSION = 2
 class ProcessingStage(Enum):
     """Stages of script execution for error tracking."""
     LOAD_CONFIG = "LOAD_CONFIG"
+    FETCH_ACTIVE_DOMAINS = "FETCH_ACTIVE_DOMAINS"
     AUTH_FETCH_OAUTH_TOKEN = "AUTH_FETCH_OAUTH_TOKEN"
     FETCH_DOMAINS = "FETCH_DOMAINS"
     FETCH_SUBSCRIPTIONS = "FETCH_SUBSCRIPTIONS"
@@ -49,6 +60,7 @@ class ProcessingStage(Enum):
     BUILD_STATUS_REPORT = "BUILD_STATUS_REPORT"
     SEND_STATUS_REPORT = "SEND_STATUS_REPORT"
     RECREATE_FAILING_SUBSCRIPTIONS = "RECREATE_FAILING_SUBSCRIPTIONS"
+    PURGE_SUBSCRIPTIONS = "PURGE_SUBSCRIPTIONS"
 
 
 @dataclass
@@ -98,10 +110,6 @@ class Config:
     callback_host: str
     callback_password: str
     cloud_id: str
-    editable_version_domain: str
-    allowed_domains: list[str]
-    disallowed_domains: list[str]
-    resellers: list[str]
 
 
 @dataclass
@@ -122,13 +130,6 @@ class CallbackConfig:
     callback_host: str
     callback_password: str
     cloud_id: str
-
-
-def _parse_comma_separated_list(value: str) -> list[str]:
-    """Parse a comma-separated string into a list, filtering empty values."""
-    if not value:
-        return []
-    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def _normalize_base_url(value: str, default_scheme: str = "https") -> str:
@@ -162,21 +163,9 @@ def load_config_from_env() -> Config:
         CALLBACK_HOST: Callback URL host with scheme (e.g., "https://api.example.com")
         CALLBACK_PASSWORD: Password for callback authentication
         CLOUD_ID: Cloud identifier
-    
-    Optional environment variables:
-        EDITABLE_VERSION_DOMAIN: Domain for editable version (default: "")
-        ALLOWED_DOMAINS: Comma-separated list of allowed domains (default: "")
-        DISALLOWED_DOMAINS: Comma-separated list of disallowed domains (default: "")
-        NS_RESELLERS: Comma-separated list of reseller names used to select
-            domains by reseller (default: "")
 
-    Domain selection rules:
-        - ALLOWED_DOMAINS and DISALLOWED_DOMAINS are mutually exclusive.
-        - ALLOWED_DOMAINS and NS_RESELLERS are mutually exclusive.
-        - NS_RESELLERS may be combined with DISALLOWED_DOMAINS to further
-          exclude individual domains from the reseller-selected set.
-        - When neither ALLOWED_DOMAINS nor NS_RESELLERS is set, the existing
-          allow-all / DISALLOWED_DOMAINS behavior is preserved.
+    Active and editable domains are not configured here; they are always
+    loaded from the Messaging active-domains endpoint (see fetch_active_domains).
 
     Schemes default to https if omitted; trailing slashes are removed.
     """
@@ -197,25 +186,12 @@ def load_config_from_env() -> Config:
     
     if missing:
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
-    
-    allowed_domains = _parse_comma_separated_list(os.environ.get("ALLOWED_DOMAINS", ""))
-    disallowed_domains = _parse_comma_separated_list(os.environ.get("DISALLOWED_DOMAINS", ""))
-    resellers = _parse_comma_separated_list(os.environ.get("NS_RESELLERS", ""))
-    
-    if allowed_domains and disallowed_domains:
-        raise RuntimeError("ALLOWED_DOMAINS and DISALLOWED_DOMAINS cannot be configured at the same time")
-    if allowed_domains and resellers:
-        raise RuntimeError("ALLOWED_DOMAINS and NS_RESELLERS cannot be configured at the same time")
-    
+
     return Config(
         ns_api_host=_normalize_base_url(ns_api_host),
         callback_host=_normalize_base_url(callback_host),
         callback_password=callback_password,
         cloud_id=cloud_id,
-        editable_version_domain=os.environ.get("EDITABLE_VERSION_DOMAIN", ""),
-        allowed_domains=allowed_domains,
-        disallowed_domains=disallowed_domains,
-        resellers=resellers,
     )
 
 
@@ -334,6 +310,7 @@ def callback_config_from_config(config: Config) -> CallbackConfig:
 class ErrorCode(Enum):
     """Error codes for unrecoverable script failures."""
     CONFIG_LOAD_FAILURE = "CONFIG_LOAD_FAILURE"
+    ACTIVE_DOMAINS_RETRIEVAL_FAILURE = "ACTIVE_DOMAINS_RETRIEVAL_FAILURE"
     AUTH_TOKEN_RETRIEVAL_FAILURE = "AUTH_TOKEN_RETRIEVAL_FAILURE"
     DOMAIN_RETRIEVAL_FAILURE = "DOMAIN_RETRIEVAL_FAILURE"
     SUBSCRIPTIONS_RETRIEVAL_FAILURE = "SUBSCRIPTIONS_RETRIEVAL_FAILURE"
@@ -347,13 +324,15 @@ def _infer_error_code(stage: ProcessingStage) -> ErrorCode:
     """Map processing stage to appropriate error code."""
     if stage == ProcessingStage.LOAD_CONFIG:
         return ErrorCode.CONFIG_LOAD_FAILURE
+    if stage == ProcessingStage.FETCH_ACTIVE_DOMAINS:
+        return ErrorCode.ACTIVE_DOMAINS_RETRIEVAL_FAILURE
     if stage == ProcessingStage.AUTH_FETCH_OAUTH_TOKEN:
         return ErrorCode.AUTH_TOKEN_RETRIEVAL_FAILURE
     if stage == ProcessingStage.FETCH_DOMAINS:
         return ErrorCode.DOMAIN_RETRIEVAL_FAILURE
     if stage in (ProcessingStage.FETCH_SUBSCRIPTIONS, ProcessingStage.REFETCH_SUBSCRIPTIONS):
         return ErrorCode.SUBSCRIPTIONS_RETRIEVAL_FAILURE
-    if stage == ProcessingStage.APPLY_SUBSCRIPTION_CHANGES:
+    if stage in (ProcessingStage.APPLY_SUBSCRIPTION_CHANGES, ProcessingStage.PURGE_SUBSCRIPTIONS):
         return ErrorCode.SUBSCRIPTION_MUTATION_FAILURE
     if stage == ProcessingStage.SEND_STATUS_REPORT:
         return ErrorCode.STATUS_REPORT_SEND_FAILURE
@@ -464,11 +443,13 @@ class ApiClient:
         base_url: str,
         access_token: Optional[str] = None,
         token_refresher: Optional[Callable[[], str]] = None,
+        timeout_seconds: Optional[float] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.access_token = access_token
         self.ssl_ctx = ssl.create_default_context()
         self._token_refresher = token_refresher
+        self._timeout_seconds = timeout_seconds
     
     def set_token(self, access_token: str):
         """Set the access token for authenticated requests."""
@@ -528,7 +509,7 @@ class ApiClient:
             request = urllib.request.Request(url, data=data, headers=headers, method=method)
 
             try:
-                with urllib.request.urlopen(request, context=self.ssl_ctx) as response:
+                with self._open(request) as response:
                     response_body = response.read().decode("utf-8")
                     if response_body:
                         return (True, json.loads(response_body))
@@ -568,6 +549,11 @@ class ApiClient:
                 print(f"JSON decode error: {e}")
                 return (True, None)  # Request succeeded but response wasn't valid JSON
     
+    def _open(self, request: urllib.request.Request):
+        if self._timeout_seconds is None:
+            return urllib.request.urlopen(request, context=self.ssl_ctx)
+        return urllib.request.urlopen(request, context=self.ssl_ctx, timeout=self._timeout_seconds)
+
     def get(self, path: str) -> Optional[dict]:
         """Make a GET request with automatic authentication."""
         return self._make_request(path, method="GET")
@@ -753,13 +739,13 @@ class Subscription:
 
 @dataclass
 class SubscriptionReviewResult:
-    subscriptions_in_disallowed_domains: list[Subscription]
+    subscriptions_in_inactive_domains: list[Subscription]
     subscriptions_in_unknown_domains: list[Subscription]
     subscriptions_with_invalid_active_server: list[Subscription]
     subscriptions_with_outdated_post_url: list[Subscription]
     domains_without_message_subscription: list[str]
     domains_without_messagesession_subscription: list[str]
-    missing_allowed_domains: list[str]
+    missing_active_domains: list[str]
 
 
 # Mirrors NetsapiensFailingSubscriptionDto returned by the callback host
@@ -784,6 +770,34 @@ class FailingSubscription:
             subscription_id=data["subscriptionId"],
         )
 
+
+# Mirrors NetsapiensActiveDomainsDto returned by the callback host
+# GET /netsapiens/callbacks/{cloudId}/active-domains endpoint.
+@dataclass
+class ActiveDomains:
+    active_domains: list[str]
+    editable_domains: list[str]
+
+
+@dataclass
+class DomainSelection:
+    """
+    Domain selection evaluated once per run from the Messaging active domains
+    and the NetSapiens domain list. Shared by failing subscription recreation,
+    review, routing and the status report so all of them describe the same decision.
+    """
+    active_domains: list[str]
+    editable_domains: list[str]
+    selected_domain_names: list[str]
+    missing_active_domains: list[str]
+
+    def is_selected(self, domain: str) -> bool:
+        return domain in self.selected_domain_names
+
+    def is_editable(self, domain: str) -> bool:
+        # Case-insensitive like ChatConnectorCallbackService.isCallbackAllowed on the server.
+        return any(editable.casefold() == domain.casefold() for editable in self.editable_domains)
+
 # ===============================================
 # Status Report Data Classes
 # ===============================================
@@ -807,8 +821,8 @@ class CoverageStatus(Enum):
     - NOT_COVERED: Domain has no subscriptions at all. Issues will include both 
       MISSING_MESSAGE_SUBSCRIPTION and MISSING_MESSAGESESSION_SUBSCRIPTION.
     
-    - EXCLUDED: Domain is filtered out by configuration (in disallowed_domains list 
-      or not in allowed_domains list). No issues are tracked for excluded domains.
+    - EXCLUDED: Domain is not in the active domains returned by the Messaging
+      active-domains endpoint. No issues are tracked for excluded domains.
     """
     FULLY_COVERED = "FULLY_COVERED"
     COVERED_WITH_ISSUES = "COVERED_WITH_ISSUES"
@@ -819,9 +833,7 @@ class CoverageStatus(Enum):
 
 class ExclusionReason(Enum):
     """Reason why a domain was excluded from coverage tracking."""
-    DISALLOWED_DOMAIN = "DISALLOWED_DOMAIN"      # Domain is in disallowed_domains list
-    NOT_IN_ALLOWED_LIST = "NOT_IN_ALLOWED_LIST"  # allowed_domains is configured but domain is not in it
-    NOT_IN_SELECTED_RESELLERS = "NOT_IN_SELECTED_RESELLERS"  # resellers is configured but domain's reseller is not in it
+    NOT_IN_ALLOWED_LIST = "NOT_IN_ALLOWED_LIST"  # Domain is not in activeDomains returned by the Messaging endpoint
 
 
 class SubscriptionIssue(Enum):
@@ -1029,95 +1041,26 @@ def extract_subscriptions_for_callback_host(data: Any, callback_host: str) -> li
         if _post_url_matches_callback_host(subscription.post_url, callback_host)
     ]
 
-def _compute_effective_domains(
-    allowed_domains: list[str],
-    disallowed_domains: list[str],
-    editable_version_domain: Optional[str]
-) -> tuple[list[str], list[str]]:
+def compute_domain_selection(active_domains: ActiveDomains, domain_infos: list[DomainInfo]) -> DomainSelection:
     """
-    Compute effective allowed and disallowed domain lists.
-    
-    Returns (effective_allowed, effective_disallowed) with editable_version_domain
-    always treated as allowed and never disallowed.
+    Evaluate which domains are managed in this run.
+
+    selected = activeDomains from Messaging that are also known to NetSapiens
+    missing  = activeDomains from Messaging that NetSapiens does not know
+
+    Domain names are compared exactly. An empty activeDomains list selects nothing.
     """
-    effective_allowed = allowed_domains.copy()
-    effective_disallowed = disallowed_domains.copy()
-    
-    if editable_version_domain:
-        # Add to allowed list if allowed domains are configured and it's not already there
-        if effective_allowed and editable_version_domain not in effective_allowed:
-            effective_allowed.append(editable_version_domain)
-        # Remove from disallowed list
-        effective_disallowed = [d for d in effective_disallowed if d != editable_version_domain]
-    
-    return effective_allowed, effective_disallowed
-
-
-def _domain_exclusion_reason(
-    domain_info: DomainInfo,
-    config: Config,
-    effective_allowed_domains: list[str],
-    effective_disallowed_domains: list[str],
-) -> Optional[ExclusionReason]:
-    """
-    Single source of truth deciding whether a domain is eligible for subscription
-    management, and if not, why.
-
-    Returns None when the domain is selected (eligible), or the ExclusionReason
-    explaining why it is excluded.
-
-    Selection precedence (mirrors the mutually-exclusive config validation in
-    load_config_from_env):
-        1. editable_version_domain is always eligible.
-        2. ALLOWED_DOMAINS configured  -> domain must be in the allowed list.
-        3. NS_RESELLERS configured     -> domain's reseller must be in the list
-           (exact, case-sensitive); a domain may still be excluded by
-           DISALLOWED_DOMAINS, which can be combined with NS_RESELLERS.
-        4. DISALLOWED_DOMAINS configured -> domain must not be in the disallowed list.
-        5. Otherwise every domain is eligible (allow-all).
-    """
-    if config.editable_version_domain and domain_info.domain == config.editable_version_domain:
-        return None
-
-    if config.allowed_domains:
-        if domain_info.domain not in effective_allowed_domains:
-            return ExclusionReason.NOT_IN_ALLOWED_LIST
-        return None
-
-    if config.resellers:
-        if domain_info.reseller not in config.resellers:
-            return ExclusionReason.NOT_IN_SELECTED_RESELLERS
-        if config.disallowed_domains and domain_info.domain in effective_disallowed_domains:
-            return ExclusionReason.DISALLOWED_DOMAIN
-        return None
-
-    if config.disallowed_domains:
-        if domain_info.domain in effective_disallowed_domains:
-            return ExclusionReason.DISALLOWED_DOMAIN
-        return None
-
-    return None
-
-
-def _compute_selected_domain_names(domain_infos: list[DomainInfo], config: Config) -> list[str]:
-    """
-    Return the list of domain names (from the API domains) that are eligible for
-    subscription management under the current config.
-
-    Uses _domain_exclusion_reason as the single source of truth so that
-    review_subscriptions and build_status_report stay consistent across the
-    allowed / reseller / disallowed / allow-all selection modes.
-    """
-    effective_allowed_domains, effective_disallowed_domains = _compute_effective_domains(
-        config.allowed_domains, config.disallowed_domains, config.editable_version_domain
+    available_domain_names = [info.domain for info in domain_infos]
+    available_domain_names_set = set(available_domain_names)
+    active_domain_names_set = set(active_domains.active_domains)
+    return DomainSelection(
+        active_domains=list(active_domains.active_domains),
+        editable_domains=list(active_domains.editable_domains),
+        selected_domain_names=[domain for domain in available_domain_names if domain in active_domain_names_set],
+        missing_active_domains=[
+            domain for domain in active_domains.active_domains if domain not in available_domain_names_set
+        ],
     )
-    return [
-        domain_info.domain
-        for domain_info in domain_infos
-        if _domain_exclusion_reason(
-            domain_info, config, effective_allowed_domains, effective_disallowed_domains
-        ) is None
-    ]
 
 
 def _find_subscription_by_domain_and_model(
@@ -1133,22 +1076,22 @@ def _find_subscription_by_domain_and_model(
 
 
 def review_subscriptions(
-    subscriptions: list[Subscription], 
-    domain_infos: list[DomainInfo], 
-    config: Config
+    subscriptions: list[Subscription],
+    domain_infos: list[DomainInfo],
+    config: Config,
+    selection: DomainSelection
 ) -> SubscriptionReviewResult:
     """
     Analyze existing subscriptions against domain metadata and configuration.
     
     - Subscriptions not targeting our callback host (config.callback_host) are filtered out.
     - Subscriptions in domains not returned by the API are marked as unknown.
-    - Domain selection follows the active mode (allowed list, NS_RESELLERS, disallowed
-      list, or allow-all) via _domain_exclusion_reason; subscriptions for known domains
-      that are not selected by the active mode are surfaced for removal.
+    - Domain selection comes from `selection` (Messaging activeDomains known to NetSapiens);
+      subscriptions for known domains that are not selected are surfaced for removal.
     - For the remaining subscriptions, abnormal `current_active_server` values are flagged
       (empty, or scheme-prefixed such as "https://host" — see _is_active_server_invalid).
-    - For each relevant domain, presence of both `message` and `messagesession` subscriptions is verified.
-    - `editable_version_domain` from `config` is always treated as eligible for the checks above even if not in allowed domains and never treated as disallowed.
+    - For each selected domain, presence of both `message` and `messagesession` subscriptions is verified.
+    - Post-url routing (live vs editable cloud id) follows `selection.editable_domains`.
     """
     
     # Filter out subscriptions that do not target our callback host to avoid touching foreign subscriptions.
@@ -1160,43 +1103,23 @@ def review_subscriptions(
         if _post_url_matches_callback_host(subscription.post_url, config.callback_host)
     ]
     
-    allowed_domains = config.allowed_domains
-    editable_version_domain = config.editable_version_domain
-    
-    # Extract domain names for membership checks
     domain_names = [info.domain for info in domain_infos]
-    
-    allowed_domains_configured = len(allowed_domains) > 0
-
-    effective_allowed_domains, _effective_disallowed_domains = _compute_effective_domains(
-        allowed_domains, config.disallowed_domains, editable_version_domain
-    )
-
-    # Domains eligible for subscription management under the active selection mode
-    # (allowed / reseller / disallowed / allow-all). Single source of truth shared
-    # with build_status_report via _domain_exclusion_reason.
-    selected_domain_names = _compute_selected_domain_names(domain_infos, config)
-    selected_domain_names_set = set(selected_domain_names)
 
     # Filter out subscriptions that are in unknown domains, not sure if this can happen, but just in case.
     subscriptions_in_unknown_domains = [
         subscription for subscription in subscriptions if subscription.domain not in domain_names
     ]
 
-    # Subscriptions whose domain is known but not selected by the active mode are
+    # Subscriptions whose domain is known but not active in Messaging are
     # out of scope and must be removed.
-    subscriptions_in_disallowed_domains = [
+    subscriptions_in_inactive_domains = [
         subscription
         for subscription in subscriptions
-        if subscription.domain in domain_names and subscription.domain not in selected_domain_names_set
+        if subscription.domain in domain_names and not selection.is_selected(subscription.domain)
     ]
 
-    missing_allowed_domains: list[str] = []
-    if allowed_domains_configured:
-        missing_allowed_domains = [domain for domain in effective_allowed_domains if domain not in domain_names]
-
     excluded_subscription_ids = {
-        subscription.id for subscription in (subscriptions_in_disallowed_domains + subscriptions_in_unknown_domains)
+        subscription.id for subscription in (subscriptions_in_inactive_domains + subscriptions_in_unknown_domains)
     }
     allowed_subscriptions = [
         subscription for subscription in subscriptions if subscription.id not in excluded_subscription_ids
@@ -1210,17 +1133,12 @@ def review_subscriptions(
     # These need their body re-posted via update_subscription so the path is healed.
     subscriptions_with_outdated_post_url = [
         subscription for subscription in allowed_subscriptions
-        if _post_url_path_is_outdated(subscription, config)
+        if _post_url_path_is_outdated(subscription, config, selection)
     ]
     domains_without_message_subscription: list[str] = []
     domains_without_messagesession_subscription: list[str] = []
 
-    # Only the selected domains are checked for missing subscriptions. The
-    # editable_version_domain is already treated as selected by
-    # _domain_exclusion_reason, so no special-casing is needed here.
-    filtered_domain_names = selected_domain_names
-
-    for domain in filtered_domain_names:
+    for domain in selection.selected_domain_names:
         # find the messagesession subscription for the domain
         messagesession_subscription = _find_subscription_by_domain_and_model(
             allowed_subscriptions, domain, SubscriptionModel.MESSAGE_SESSION
@@ -1235,13 +1153,13 @@ def review_subscriptions(
             domains_without_message_subscription.append(domain)
 
     return SubscriptionReviewResult(
-        subscriptions_in_disallowed_domains=subscriptions_in_disallowed_domains,
+        subscriptions_in_inactive_domains=subscriptions_in_inactive_domains,
         subscriptions_in_unknown_domains=subscriptions_in_unknown_domains,
         subscriptions_with_invalid_active_server=subscriptions_with_invalid_active_server,
         subscriptions_with_outdated_post_url=subscriptions_with_outdated_post_url,
         domains_without_message_subscription=domains_without_message_subscription,
         domains_without_messagesession_subscription=domains_without_messagesession_subscription,
-        missing_allowed_domains=missing_allowed_domains
+        missing_active_domains=selection.missing_active_domains
     )
 
 
@@ -1253,6 +1171,7 @@ def build_status_report(
     subscriptions: list[Subscription],
     domain_infos: list[DomainInfo],
     config: Config,
+    selection: DomainSelection,
     report_timestamp: str
 ) -> StatusReport:
     """
@@ -1271,11 +1190,7 @@ def build_status_report(
     ]
     
     domain_names = [info.domain for info in domain_infos]
-    
-    effective_allowed_domains, effective_disallowed_domains = _compute_effective_domains(
-        config.allowed_domains, config.disallowed_domains, config.editable_version_domain
-    )
-    
+
     # Build domain reports
     domain_reports: list[DomainReport] = []
     orphaned_subscriptions: list[OrphanedSubscriptionReport] = []
@@ -1285,21 +1200,14 @@ def build_status_report(
     covered_with_issues_count = 0
     partially_covered_count = 0
     uncovered_count = 0
-    
-    # Compute effective domain list (domains that should be processed) using the
-    # same selection source of truth as review_subscriptions.
-    effective_domain_names = _compute_selected_domain_names(domain_infos, config)
-    
+
     # Process each domain from the API
     for domain_info in domain_infos:
         domain = domain_info.domain
         reseller = domain_info.reseller
         
-        # Determine if domain is excluded under the active selection mode.
-        exclusion_reason = _domain_exclusion_reason(
-            domain_info, config, effective_allowed_domains, effective_disallowed_domains
-        )
-        is_excluded = exclusion_reason is not None
+        is_excluded = not selection.is_selected(domain)
+        exclusion_reason = ExclusionReason.NOT_IN_ALLOWED_LIST if is_excluded else None
         
         # Find subscriptions for this domain
         message_sub = _find_subscription_by_domain_and_model(our_subscriptions, domain, SubscriptionModel.MESSAGE)
@@ -1369,20 +1277,21 @@ def build_status_report(
                 post_url=sub.post_url
             ))
     
-    # Build configuration
+    # Keeps the existing report contract: allowed_domains carries the Messaging activeDomains,
+    # the removed configuration filters are reported empty. Editable routing is visible in post_url.
     configuration = StatusReportConfiguration(
         ns_api_host=config.ns_api_host,
         callback_host=config.callback_host,
-        allowed_domains=config.allowed_domains,
-        disallowed_domains=config.disallowed_domains,
-        resellers=config.resellers,
-        editable_version_domain=config.editable_version_domain
+        allowed_domains=selection.active_domains,
+        disallowed_domains=[],
+        resellers=[],
+        editable_version_domain=""
     )
     
     # Build summary
     summary = StatusReportSummary(
         total_domains_from_api=len(domain_infos),
-        effective_domains_count=len(effective_domain_names),
+        effective_domains_count=len(selection.selected_domain_names),
         fully_covered_domains_count=fully_covered_count,
         covered_with_issues_domains_count=covered_with_issues_count,
         partially_covered_domains_count=partially_covered_count,
@@ -1428,27 +1337,26 @@ def send_status_report(report: StatusReport, config: Config) -> bool:
         return False
 
 
-# Suffix appended to cloud_id for editable version domain to indicate wildcard matching
+# Suffix appended to cloud_id for editable domains to route callbacks to the editable app version
 EDITABLE_VERSION_CLOUD_ID_SUFFIX = "*"
 
 
-def _build_post_url(model: SubscriptionModel, domain: str, config: Config) -> str:
+def _build_post_url(model: SubscriptionModel, domain: str, config: Config, selection: DomainSelection) -> str:
     """
-    Build the canonical post-url for a (model, domain) pair under the current config.
+    Build the canonical post-url for a (model, domain) pair under the current config
+    and the editable routing loaded from Messaging.
 
     Single source of truth for both creating new subscriptions and validating
     existing ones (see _post_url_path_is_outdated).
     """
     path_suffix = model.to_path_suffix()
     encoded_password = urllib.parse.quote(config.callback_password, safe='')
-    # Append wildcard suffix for editable version domain to allow broader matching
-    is_editable_domain = domain == config.editable_version_domain
-    needs_suffix = is_editable_domain and not config.cloud_id.endswith(EDITABLE_VERSION_CLOUD_ID_SUFFIX)
+    needs_suffix = selection.is_editable(domain) and not config.cloud_id.endswith(EDITABLE_VERSION_CLOUD_ID_SUFFIX)
     cloud_id = f"{config.cloud_id}{EDITABLE_VERSION_CLOUD_ID_SUFFIX}" if needs_suffix else config.cloud_id
     return f"{config.callback_host}/netsapiens/callbacks/{cloud_id}/{path_suffix}?password={encoded_password}"
 
 
-def _post_url_path_is_outdated(subscription: Subscription, config: Config) -> bool:
+def _post_url_path_is_outdated(subscription: Subscription, config: Config, selection: DomainSelection) -> bool:
     """
     Return True if the subscription's post_url path no longer matches the canonical
     path computed from the current config (e.g. because cloud_id has changed since
@@ -1465,7 +1373,7 @@ def _post_url_path_is_outdated(subscription: Subscription, config: Config) -> bo
     if subscription.model not in (SubscriptionModel.MESSAGE, SubscriptionModel.MESSAGE_SESSION):
         return False
     expected_path = urllib.parse.urlparse(
-        _build_post_url(subscription.model, subscription.domain, config)
+        _build_post_url(subscription.model, subscription.domain, config, selection)
     ).path
     actual_path = urllib.parse.urlparse(subscription.post_url).path
     return actual_path != expected_path
@@ -1535,6 +1443,7 @@ def _build_subscription_body(
     user_scope: str,
     subscription_expires: str,
     config: Config,
+    selection: DomainSelection,
     current_active_server: str = ""
 ) -> dict:
     """
@@ -1545,7 +1454,7 @@ def _build_subscription_body(
     that have no existing subscription pass an empty current_active_server and
     therefore always take preferred-server from config.
     """
-    post_url = _build_post_url(model, domain, config)
+    post_url = _build_post_url(model, domain, config, selection)
 
     preferred_server_host = _resolve_preferred_server_host(current_active_server, config)
 
@@ -1614,10 +1523,13 @@ def create_subscription(
     user_scope: str,
     subscription_expires: str,
     config: Config,
+    selection: DomainSelection,
     current_active_server: str = ""
 ) -> Optional[str]:
     """Create a subscription and return the subscription ID."""
-    json_body = _build_subscription_body(model, domain, reseller, user_scope, subscription_expires, config, current_active_server)
+    json_body = _build_subscription_body(
+        model, domain, reseller, user_scope, subscription_expires, config, selection, current_active_server
+    )
 
     _throttle_subscription_creates()
 
@@ -1663,7 +1575,8 @@ def update_subscription(
     reseller: str,
     user_scope: str,
     subscription_expires: str,
-    config: Config
+    config: Config,
+    selection: DomainSelection
 ) -> bool:
     """Update a subscription. Returns True on success, False on failure."""
     json_body = _build_subscription_body(
@@ -1673,6 +1586,7 @@ def update_subscription(
         user_scope,
         subscription_expires,
         config,
+        selection,
         current_active_server=subscription.current_active_server,
     )
     
@@ -1714,6 +1628,96 @@ def delete_subscription(client: ApiClient, subscription_id: str) -> bool:
     else:
         print(f"Error: Failed to delete subscription {subscription_id}")
     return success
+
+# ===============================================
+# Active Domains Retrieval
+# ===============================================
+
+_ACTIVE_DOMAINS_TIMEOUT_SECONDS = 15.0
+
+
+def fetch_active_domains(callback_config: CallbackConfig) -> ActiveDomains:
+    """
+    Fetch active and editable domains from the callback host. This is the only
+    source of the domain selection; there is no fallback to configuration.
+
+    GET to: {callback_host}/netsapiens/callbacks/{cloud_id}/active-domains?password={callback_password}
+
+    The exact configured cloud_id (including a possible editable '*' suffix) is used,
+    because the callback host authenticates against the connector of that cloud_id.
+
+    Raises RuntimeError when the request fails or the payload is not a valid
+    {"activeDomains": [...], "editableDomains": [...]} object. An empty body,
+    unparseable JSON or a missing field is never treated as an empty list.
+    """
+    encoded_cloud_id = urllib.parse.quote(callback_config.cloud_id, safe="")
+    encoded_password = urllib.parse.quote(callback_config.callback_password, safe="")
+    endpoint_for_logging = (
+        f"{callback_config.callback_host}/netsapiens/callbacks/{encoded_cloud_id}/active-domains"
+    )
+    path = f"/netsapiens/callbacks/{encoded_cloud_id}/active-domains?password={encoded_password}"
+
+    callback_client = ApiClient(callback_config.callback_host, timeout_seconds=_ACTIVE_DOMAINS_TIMEOUT_SECONDS)
+    print(f"Fetching active domains from {endpoint_for_logging}...")
+
+    success, response = callback_client.get_with_status(path)
+    if not success:
+        raise RuntimeError(f"Failed to fetch active domains from {endpoint_for_logging}")
+    if response is None:
+        raise RuntimeError(
+            f"Active domains response from {endpoint_for_logging} has an empty or unparseable body"
+        )
+
+    active_domains = parse_active_domains(response)
+    print(
+        f"Loaded active domains from Messaging API: "
+        f"activeDomains count={len(active_domains.active_domains)} "
+        f"{_format_list_preview(active_domains.active_domains)}, "
+        f"editableDomains count={len(active_domains.editable_domains)} "
+        f"{_format_list_preview(active_domains.editable_domains)}"
+    )
+    return active_domains
+
+
+def parse_active_domains(data: Any) -> ActiveDomains:
+    """Validate the active-domains payload and return deduplicated domain lists."""
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Expected active domains object, got {type(data).__name__}")
+    return ActiveDomains(
+        active_domains=_parse_domain_name_list(data, "activeDomains"),
+        editable_domains=_parse_domain_name_list(data, "editableDomains"),
+    )
+
+
+def _parse_domain_name_list(data: dict, field_name: str) -> list[str]:
+    if field_name not in data:
+        raise RuntimeError(f"Missing '{field_name}' in active domains response")
+    values = data[field_name]
+    if not isinstance(values, list):
+        raise RuntimeError(f"Expected '{field_name}' to be a list, got {type(values).__name__}")
+    for index, value in enumerate(values):
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"Invalid domain name at '{field_name}'[{index}]: {value!r}")
+    return list(dict.fromkeys(values))
+
+
+def log_domain_selection(callback_config: CallbackConfig, selection: DomainSelection) -> None:
+    print(
+        f"[DOMAIN_SELECTION] source=messaging-api "
+        f"active={_format_list_preview(selection.active_domains)} "
+        f"editable={_format_list_preview(selection.editable_domains)} "
+        f"selected count={len(selection.selected_domain_names)} {_format_list_preview(selection.selected_domain_names)} "
+        f"missing={_format_list_preview(selection.missing_active_domains)}"
+    )
+    if selection.missing_active_domains:
+        send_script_log(
+            callback_config=callback_config,
+            level="WARN",
+            message=(
+                f"Active domains from Messaging are not known to NetSapiens, no subscriptions are created for them: "
+                f"count={len(selection.missing_active_domains)} {_format_list_preview(selection.missing_active_domains)}"
+            ),
+        )
 
 # ===============================================
 # Failing Subscriptions Recreation
@@ -1790,6 +1794,7 @@ def mark_failing_subscription_deleted(
 def recreate_failing_subscriptions(
     client: ApiClient,
     config: Config,
+    selection: DomainSelection,
     domain_to_reseller: dict[str, str],
     current_subscriptions: list[Subscription],
     user_scope: str,
@@ -1801,7 +1806,9 @@ def recreate_failing_subscriptions(
     For every failing record returned by the callback host this function tries to:
       1. Delete the existing subscription from NetSapiens (looked up by subscription id
          in the previously fetched current NS subscriptions).
-      2. Create a new subscription for the same (domain, model) using the existing helper.
+      2. Create a new subscription for the same (domain, model) using the existing helper,
+         only when the subscription's domain is selected in this run. A subscription of a
+         domain outside the selection is removed without replacement.
       3. Mark the failing subscription record on the callback host as soft-deleted.
 
     A successful recreation emits an INFO log to the subscriptions-script-log endpoint;
@@ -1833,6 +1840,7 @@ def recreate_failing_subscriptions(
             _recreate_failing_subscription(
                 client=client,
                 config=config,
+                selection=selection,
                 callback_config=callback_config,
                 subscriptions_by_id=subscriptions_by_id,
                 domain_to_reseller=domain_to_reseller,
@@ -1863,6 +1871,7 @@ def recreate_failing_subscriptions(
 def _recreate_failing_subscription(
     client: ApiClient,
     config: Config,
+    selection: DomainSelection,
     callback_config: CallbackConfig,
     subscriptions_by_id: dict[str, Subscription],
     domain_to_reseller: dict[str, str],
@@ -1905,6 +1914,12 @@ def _recreate_failing_subscription(
         )
         return
 
+    if not selection.is_selected(existing_subscription.domain):
+        _remove_failing_subscription_of_unselected_domain(
+            client, callback_config, failing_subscription, existing_subscription
+        )
+        return
+
     reseller = domain_to_reseller.get(existing_subscription.domain)
     if not reseller:
         raise RuntimeError(
@@ -1929,6 +1944,7 @@ def _recreate_failing_subscription(
             user_scope=user_scope,
             subscription_expires=subscription_expires,
             config=config,
+            selection=selection,
             current_active_server=existing_subscription.current_active_server,
         )
         if new_subscription_id is None:
@@ -1953,17 +1969,59 @@ def _recreate_failing_subscription(
             ),
         )
     finally:
-        if not mark_failing_subscription_deleted(callback_config, failing_subscription.subscription_id):
-            send_script_log(
-                callback_config=callback_config,
-                level="WARN",
-                message=(
-                    f"Failed to mark failing record as deleted on callback host after deleting NS subscription: "
-                    f"oldSubscriptionId={failing_subscription.subscription_id}, "
-                    f"domain={existing_subscription.domain}, "
-                    f"model={existing_subscription.model.value}"
-                ),
-            )
+        _mark_failing_subscription_deleted_after_ns_delete(callback_config, failing_subscription, existing_subscription)
+
+
+def _remove_failing_subscription_of_unselected_domain(
+    client: ApiClient,
+    callback_config: CallbackConfig,
+    failing_subscription: FailingSubscription,
+    existing_subscription: Subscription,
+) -> None:
+    """
+    Delete a failing subscription whose domain is not active in Messaging, without
+    creating a replacement that the following cleanup would delete again. The failing
+    record is marked as deleted only after the NetSapiens delete succeeded.
+    """
+    if not delete_subscription(client, existing_subscription.id):
+        raise RuntimeError(
+            f"Failed to delete failing subscription {existing_subscription.id} of inactive domain "
+            f"(domain={existing_subscription.domain}, model={existing_subscription.model.value})"
+        )
+
+    print(
+        f"Removed failing subscription of inactive domain without replacement: "
+        f"id={existing_subscription.id}, domain={existing_subscription.domain}, "
+        f"model={existing_subscription.model.value}"
+    )
+    send_script_log(
+        callback_config=callback_config,
+        level="INFO",
+        message=(
+            f"Removed failing subscription of inactive domain without replacement: "
+            f"subscriptionId={existing_subscription.id}, domain={existing_subscription.domain}, "
+            f"model={existing_subscription.model.value}"
+        ),
+    )
+    _mark_failing_subscription_deleted_after_ns_delete(callback_config, failing_subscription, existing_subscription)
+
+
+def _mark_failing_subscription_deleted_after_ns_delete(
+    callback_config: CallbackConfig,
+    failing_subscription: FailingSubscription,
+    existing_subscription: Subscription,
+) -> None:
+    if not mark_failing_subscription_deleted(callback_config, failing_subscription.subscription_id):
+        send_script_log(
+            callback_config=callback_config,
+            level="WARN",
+            message=(
+                f"Failed to mark failing record as deleted on callback host after deleting NS subscription: "
+                f"oldSubscriptionId={failing_subscription.subscription_id}, "
+                f"domain={existing_subscription.domain}, "
+                f"model={existing_subscription.model.value}"
+            ),
+        )
 
 
 # ===============================================
@@ -2128,6 +2186,145 @@ def get_authenticated_api_client(
     return AuthResult(client=client, user_scope=user_scope)
 
 # ===============================================
+# Subscription Purge
+# ===============================================
+
+# Path of post-urls created by this script: /netsapiens/callbacks/{cloud_id}/{message|message-session}.
+# Domain subscriptions created by Messaging (/netsapiens/callbacks/{cloud_id}/domain/{domain}/...)
+# deliberately do not match.
+_SCRIPT_POST_URL_PATH_PATTERN = re.compile(r"^/netsapiens/callbacks/([^/]+)/(message|message-session)$")
+
+
+@dataclass
+class PurgeResult:
+    matched_subscriptions: list[Subscription]
+    failed_subscription_ids: list[str]
+
+
+def _script_post_url_cloud_id(post_url: str) -> Optional[str]:
+    match = _SCRIPT_POST_URL_PATH_PATTERN.match(urllib.parse.urlparse(post_url).path)
+    return match.group(1) if match else None
+
+
+def is_purgeable_subscription(subscription: Subscription, callback_host: str) -> bool:
+    """Return True for subscriptions of our callback host that follow the script's post-url pattern, for any cloud id."""
+    return (
+        _post_url_matches_callback_host(subscription.post_url, callback_host)
+        and _script_post_url_cloud_id(subscription.post_url) is not None
+    )
+
+
+def _post_url_without_query(post_url: str) -> str:
+    # The query carries the callback password of the subscription's cloud id, which may belong to another app.
+    parsed = urllib.parse.urlparse(post_url)
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+
+def _print_purge_candidates(subscriptions: list[Subscription]) -> None:
+    for subscription in subscriptions:
+        print(
+            f"  id={subscription.id} domain={subscription.domain} model={subscription.model.value} "
+            f"cloudId={_script_post_url_cloud_id(subscription.post_url)} "
+            f"post-url={_post_url_without_query(subscription.post_url)}"
+        )
+
+
+def purge_subscriptions(context: ProcessingContext, execute: bool) -> PurgeResult:
+    """
+    Delete every subscription on our callback host whose post-url follows the script's
+    pattern, regardless of cloud id. Without `execute` only lists what would be deleted.
+
+    Active domains are not loaded and nothing is created, updated or reported.
+    Raises RuntimeError after all deletes were attempted if any of them failed.
+    """
+    set_stage(context, ProcessingStage.LOAD_CONFIG)
+    config, oauth_config = load_all_config_from_env()
+
+    auth = get_authenticated_api_client(config=config, oauth_config=oauth_config, context=context)
+
+    set_stage(context, ProcessingStage.FETCH_SUBSCRIPTIONS)
+    print("\nFetching subscriptions...")
+    subscriptions = fetch_subscriptions(auth.client)
+    if subscriptions is None:
+        raise RuntimeError("Failed to fetch subscriptions: Empty response")
+
+    matched = [
+        subscription for subscription in subscriptions
+        if is_purgeable_subscription(subscription, config.callback_host)
+    ]
+    print(
+        f"Found {len(matched)} of {len(subscriptions)} subscriptions matching "
+        f"{config.callback_host}/netsapiens/callbacks/{{cloudId}}/(message|message-session):"
+    )
+    _print_purge_candidates(matched)
+
+    if not execute:
+        print("Dry run: no subscription was deleted. Add --execute to delete them.")
+        return PurgeResult(matched_subscriptions=matched, failed_subscription_ids=[])
+
+    set_stage(context, ProcessingStage.PURGE_SUBSCRIPTIONS)
+    failed_ids = [
+        subscription.id for subscription in matched
+        if not delete_subscription(auth.client, subscription.id)
+    ]
+    _report_purge_result(config, matched, failed_ids)
+    if failed_ids:
+        raise RuntimeError(
+            f"Failed to delete {len(failed_ids)} of {len(matched)} subscriptions: {_format_list_preview(failed_ids)}"
+        )
+    return PurgeResult(matched_subscriptions=matched, failed_subscription_ids=failed_ids)
+
+
+def _report_purge_result(config: Config, matched: list[Subscription], failed_ids: list[str]) -> None:
+    deleted_count = len(matched) - len(failed_ids)
+    cloud_ids = sorted({_script_post_url_cloud_id(subscription.post_url) for subscription in matched})
+    message = (
+        f"Purged subscriptions of callback host {config.callback_host}: "
+        f"deleted={deleted_count}, failed={len(failed_ids)}, cloudIds={_format_list_preview(cloud_ids)}"
+    )
+    print(message)
+    send_script_log(
+        callback_config=callback_config_from_config(config),
+        level="ERROR" if failed_ids else "INFO",
+        message=message if not failed_ids else f"{message}, failedIds={_format_list_preview(failed_ids)}",
+    )
+
+
+def parse_arguments(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="NetSapiens message events subscription management")
+    parser.add_argument(
+        "--purge-subscriptions",
+        action="store_true",
+        help=(
+            "Purge mode: list subscriptions of CALLBACK_HOST whose post-url matches "
+            "/netsapiens/callbacks/{cloudId}/(message|message-session) for any cloudId "
+            "(dry run unless --execute is given); no regular processing is done"
+        ),
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Together with --purge-subscriptions actually delete the listed subscriptions",
+    )
+    args = parser.parse_args(argv)
+    if args.execute and not args.purge_subscriptions:
+        parser.error("--execute can only be used together with --purge-subscriptions")
+    return args
+
+
+def describe_run_mode(args: argparse.Namespace) -> str:
+    if not args.purge_subscriptions:
+        return ""
+    return " (purge mode, execute)" if args.execute else " (purge mode, dry run)"
+
+
+def run(context: ProcessingContext, args: argparse.Namespace) -> None:
+    if args.purge_subscriptions:
+        purge_subscriptions(context, execute=args.execute)
+    else:
+        main(context)
+
+# ===============================================
 # Main
 # ===============================================
 
@@ -2137,16 +2334,23 @@ def main(context: Optional[ProcessingContext] = None):
     
     set_stage(context, ProcessingStage.LOAD_CONFIG)
     config, oauth_config = load_all_config_from_env()
-    
+    callback_config = callback_config_from_config(config)
+
+    set_stage(context, ProcessingStage.FETCH_ACTIVE_DOMAINS)
+    active_domains = fetch_active_domains(callback_config)
+
     auth = get_authenticated_api_client(config=config, oauth_config=oauth_config, context=context)
     client = auth.client
     user_scope = auth.user_scope
-    
+
     set_stage(context, ProcessingStage.FETCH_DOMAINS)
     domain_infos = get_domain_list(client)
-    
+
     # Build a lookup dictionary for domain -> reseller
     domain_to_reseller = {info.domain: info.reseller for info in domain_infos}
+
+    selection = compute_domain_selection(active_domains, domain_infos)
+    log_domain_selection(callback_config, selection)
 
     set_stage(context, ProcessingStage.FETCH_SUBSCRIPTIONS)
     # List all subscriptions
@@ -2165,6 +2369,7 @@ def main(context: Optional[ProcessingContext] = None):
     recreate_failing_subscriptions(
         client=client,
         config=config,
+        selection=selection,
         domain_to_reseller=domain_to_reseller,
         current_subscriptions=subscriptions,
         user_scope=user_scope,
@@ -2181,19 +2386,20 @@ def main(context: Optional[ProcessingContext] = None):
     subs_review = review_subscriptions(
         subscriptions,
         domain_infos,
-        config=config
+        config=config,
+        selection=selection
     )
-    disallowed_subs = subs_review.subscriptions_in_disallowed_domains
+    inactive_subs = subs_review.subscriptions_in_inactive_domains
     unknown_subs = subs_review.subscriptions_in_unknown_domains
     invalid_active_server_subs = subs_review.subscriptions_with_invalid_active_server
     outdated_post_url_subs = subs_review.subscriptions_with_outdated_post_url
-    print(f"Subscriptions in disallowed domains: {_format_subscription_list(disallowed_subs)}")
+    print(f"Subscriptions in inactive domains: {_format_subscription_list(inactive_subs)}")
     print(f"Subscriptions in unknown domains: {_format_subscription_list(unknown_subs)}")
     print(f"Subscriptions with invalid active server: {_format_subscription_list(invalid_active_server_subs)}")
     print(f"Subscriptions with outdated post-url path: {_format_subscription_list(outdated_post_url_subs)}")
     print(f"Domains without message subscription: {_format_list_preview(subs_review.domains_without_message_subscription)}")
     print(f"Domains without messagesession subscription: {_format_list_preview(subs_review.domains_without_messagesession_subscription)}")
-    print(f"Missing allowed domains: {_format_list_preview(subs_review.missing_allowed_domains)}")
+    print(f"Active domains missing in NetSapiens: {_format_list_preview(subs_review.missing_active_domains)}")
 
     set_stage(context, ProcessingStage.APPLY_SUBSCRIPTION_CHANGES)
 
@@ -2201,8 +2407,8 @@ def main(context: Optional[ProcessingContext] = None):
     failed_updates: list[str] = []
     failed_creates: list[str] = []
 
-    # delete subs in disallowed domains and unknown domains
-    subscriptions_to_delete = subs_review.subscriptions_in_disallowed_domains + subs_review.subscriptions_in_unknown_domains
+    # delete subs in inactive domains and unknown domains
+    subscriptions_to_delete = subs_review.subscriptions_in_inactive_domains + subs_review.subscriptions_in_unknown_domains
     for subscription in subscriptions_to_delete:
         print(f"Deleting subscription: {subscription.id}")
         if not delete_subscription(client, subscription.id):
@@ -2233,6 +2439,7 @@ def main(context: Optional[ProcessingContext] = None):
             user_scope,
             subscription_expires,
             config,
+            selection,
         ):
             failed_updates.append(f"{subscription.id} (domain={subscription.domain}, model={subscription.model.value})")
     
@@ -2249,6 +2456,7 @@ def main(context: Optional[ProcessingContext] = None):
             user_scope,
             subscription_expires,
             config,
+            selection,
         )
         if sub_id is None:
             failed_creates.append(f"message for domain={domain}")
@@ -2266,6 +2474,7 @@ def main(context: Optional[ProcessingContext] = None):
             user_scope,
             subscription_expires,
             config,
+            selection,
         )
         if sub_id is None:
             failed_creates.append(f"messagesession for domain={domain}")
@@ -2280,9 +2489,8 @@ def main(context: Optional[ProcessingContext] = None):
             parts.append(f"create failures ({len(failed_creates)}): {_format_list_preview(failed_creates)}")
         failure_summary = "; ".join(parts)
 
-        cb_cfg = callback_config_from_config(config)
         send_script_log(
-            callback_config=cb_cfg,
+            callback_config=callback_config,
             level="ERROR",
             message=f"Subscription mutation errors during APPLY_SUBSCRIPTION_CHANGES: {failure_summary}",
         )
@@ -2302,6 +2510,7 @@ def main(context: Optional[ProcessingContext] = None):
         subscriptions=updated_subscriptions,
         domain_infos=domain_infos,
         config=config,
+        selection=selection,
         report_timestamp=report_timestamp
     )
     
@@ -2310,9 +2519,11 @@ def main(context: Optional[ProcessingContext] = None):
         raise RuntimeError("Failed to send status report")
 
 if __name__ == "__main__":
+    cli_args = parse_arguments(sys.argv[1:])
+    run_mode = describe_run_mode(cli_args)
     ctx = ProcessingContext()
-    print("[INFO] Subscriptions script started")
-    
+    print(f"[INFO] Subscriptions script started{run_mode}")
+
     callback_cfg: Optional[CallbackConfig] = None
     try:
         callback_cfg = load_callback_config_from_env()
@@ -2324,7 +2535,7 @@ if __name__ == "__main__":
             ok = send_script_log(
                 callback_config=callback_cfg,
                 level="INFO",
-                message="Subscriptions script started",
+                message=f"Subscriptions script started{run_mode}",
             )
             if not ok:
                 print("[WARN] Remote start log failed; continuing with local stdout only")
@@ -2332,7 +2543,7 @@ if __name__ == "__main__":
             print(f"[WARN] Remote start log threw exception; continuing: {e}")
     
     try:
-        main(context=ctx)
+        run(ctx, cli_args)
     except KeyboardInterrupt:
         raise
     except Exception as e:
@@ -2372,13 +2583,13 @@ if __name__ == "__main__":
 
         raise
     else:
-        print("[INFO] Subscriptions script completed successfully")
+        print(f"[INFO] Subscriptions script completed successfully{run_mode}")
         if callback_cfg is not None:
             try:
                 ok = send_script_log(
                     callback_config=callback_cfg,
                     level="INFO",
-                    message="Subscriptions script completed successfully",
+                    message=f"Subscriptions script completed successfully{run_mode}",
                 )
                 if not ok:
                     print("[WARN] Remote completion log failed")
